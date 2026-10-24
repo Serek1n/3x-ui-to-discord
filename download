@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+subscriptions.db*
+bot.log
+login_debug_screenshot.png
