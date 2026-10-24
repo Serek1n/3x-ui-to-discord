@@ -2,10 +2,11 @@
 # Создаёт архив текущего состояния бота (код + база данных + .env) в /opt/backups.
 # Запуск: sudo bash backup.sh
 # Ежедневно в 4:00 автоматически (одна команда):
-#   (sudo crontab -l 2>/dev/null; echo "0 4 * * * bash /opt/xui-discord-bot/backup.sh >/dev/null 2>&1") | sudo crontab -
+#   (sudo crontab -l 2>/dev/null; echo "0 4 * * * bash /opt/3x-ui-to-discord/backup.sh >/dev/null 2>&1") | sudo crontab -
 set -e
 
-APP_DIR="/opt/xui-discord-bot"
+# Папка бота = папка, где лежит этот скрипт (у вас может быть не /opt/xui-discord-bot)
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_DIR="/opt/backups"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 TMP_DIR=$(mktemp -d)

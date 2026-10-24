@@ -31,6 +31,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import time
 from collections import Counter
 
@@ -50,42 +51,58 @@ from xui_client import XUIClient, XUIError  # noqa: E402
 log = logging.getLogger("nexus")
 
 
+def _env(name: str, default: str = "") -> str:
+    """Значение из окружения без комментария в конце строки. systemd
+    (EnvironmentFile) не отрезает "  # комментарий" после значения, и без
+    этого, например, TEST_GUILD_ID превращается в "123...  # id сервера"."""
+    value = os.environ.get(name, default)
+    return re.sub(r"\s+#.*$", "", value).strip()
+
+
+def _env_int(name: str, default: str) -> int:
+    value = _env(name, default)
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"Ошибка в .env: {name}={value!r} - должно быть целое число")
+
+
 def _env_bool(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+    return _env(name, default).lower() in ("1", "true", "yes", "on")
 
 
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-XUI_BASE_URL = os.environ.get("XUI_BASE_URL", "http://127.0.0.1:2053")
-XUI_USERNAME = os.environ["XUI_USERNAME"]
-XUI_PASSWORD = os.environ["XUI_PASSWORD"]
-XUI_INBOUND_ID = int(os.environ.get("XUI_INBOUND_ID", "1"))
-XUI_SUB_BASE = os.environ.get("XUI_SUB_BASE", "http://127.0.0.1:2096/sub").rstrip("/")
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"].strip()
+XUI_BASE_URL = _env("XUI_BASE_URL", "http://127.0.0.1:2053")
+XUI_USERNAME = _env("XUI_USERNAME") or os.environ["XUI_USERNAME"]
+XUI_PASSWORD = os.environ["XUI_PASSWORD"].strip()
+XUI_INBOUND_ID = _env_int("XUI_INBOUND_ID", "1")
+XUI_SUB_BASE = _env("XUI_SUB_BASE", "http://127.0.0.1:2096/sub").rstrip("/")
 XUI_VERIFY_SSL = _env_bool("XUI_VERIFY_SSL", "true")
-XUI_WEB_BASE_PATH = os.environ.get("XUI_WEB_BASE_PATH", "")
-XUI_STATIC_CSRF_TOKEN = os.environ.get("XUI_STATIC_CSRF_TOKEN", "")
-ADMIN_ROLE_NAME = os.environ.get("ADMIN_ROLE_NAME", "VPN Admin")
-HAPP_PROVIDER_ID = os.environ.get("HAPP_PROVIDER_ID", "")
-TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "10"))
-DEVICE_LIMIT = int(os.environ.get("DEVICE_LIMIT", "3"))
-TEST_GUILD_ID = os.environ.get("TEST_GUILD_ID", "")
+XUI_WEB_BASE_PATH = _env("XUI_WEB_BASE_PATH", "")
+XUI_STATIC_CSRF_TOKEN = _env("XUI_STATIC_CSRF_TOKEN", "")
+ADMIN_ROLE_NAME = _env("ADMIN_ROLE_NAME", "VPN Admin")
+HAPP_PROVIDER_ID = _env("HAPP_PROVIDER_ID", "")
+TRIAL_DAYS = _env_int("TRIAL_DAYS", "10")
+DEVICE_LIMIT = _env_int("DEVICE_LIMIT", "3")
+TEST_GUILD_ID = _env("TEST_GUILD_ID", "")
 
 # Одна универсальная роль вместо тарифных: пока она есть - VPN работает.
-VPN_ROLE_NAME = os.environ.get("VPN_ROLE_NAME", "VPN Access")
+VPN_ROLE_NAME = _env("VPN_ROLE_NAME", "VPN Access")
 # Роль разового пробного доступа.
-TRIAL_ROLE_NAME = os.environ.get("TRIAL_ROLE_NAME", "VPN Trial")
+TRIAL_ROLE_NAME = _env("TRIAL_ROLE_NAME", "VPN Trial")
 
 # URL вебхука канала, куда /status_server публикует карточку статуса.
-STATUS_WEBHOOK_URL = os.environ.get("STATUS_WEBHOOK_URL", "")
+STATUS_WEBHOOK_URL = _env("STATUS_WEBHOOK_URL", "")
 # Необязательный вебхук закрытого канала для админов: туда бот пишет об
 # ошибках выдачи/удаления, чтобы о проблеме с оплатившим клиентом узнали сразу.
-ADMIN_LOG_WEBHOOK_URL = os.environ.get("ADMIN_LOG_WEBHOOK_URL", "")
+ADMIN_LOG_WEBHOOK_URL = _env("ADMIN_LOG_WEBHOOK_URL", "")
 # Как часто сверять роли всех участников с подписками (минуты, 0 = выключить).
-SYNC_INTERVAL_MINUTES = int(os.environ.get("SYNC_INTERVAL_MINUTES", "30"))
+SYNC_INTERVAL_MINUTES = _env_int("SYNC_INTERVAL_MINUTES", "30")
 # Снимать роль VPN Trial после окончания пробного периода (нужно право
 # "Управление ролями", и роль бота должна быть выше роли VPN Trial).
 REMOVE_TRIAL_ROLE_ON_EXPIRY = _env_bool("REMOVE_TRIAL_ROLE_ON_EXPIRY", "true")
 # Защита от спама /status_server (секунд на одного пользователя).
-STATUS_COOLDOWN_SEC = int(os.environ.get("STATUS_COOLDOWN_SEC", "30"))
+STATUS_COOLDOWN_SEC = _env_int("STATUS_COOLDOWN_SEC", "30")
 
 
 def _plural_days(n: int) -> str:

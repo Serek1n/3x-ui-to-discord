@@ -11,6 +11,7 @@
 
 import asyncio
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -19,13 +20,19 @@ from xui_client import XUIClient, XUIError
 
 load_dotenv()
 
-XUI_BASE_URL = os.environ.get("XUI_BASE_URL", "")
-XUI_USERNAME = os.environ.get("XUI_USERNAME", "")
-XUI_PASSWORD = os.environ.get("XUI_PASSWORD", "")
-XUI_VERIFY_SSL = os.environ.get("XUI_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
-XUI_WEB_BASE_PATH = os.environ.get("XUI_WEB_BASE_PATH", "")
-XUI_STATIC_CSRF_TOKEN = os.environ.get("XUI_STATIC_CSRF_TOKEN", "")
-XUI_INBOUND_ID = os.environ.get("XUI_INBOUND_ID", "1")
+
+def _env(name, default=""):
+    # Отрезаем "  # комментарий" после значения (systemd его не убирает).
+    return re.sub(r"\s+#.*$", "", os.environ.get(name, default)).strip()
+
+
+XUI_BASE_URL = _env("XUI_BASE_URL", "")
+XUI_USERNAME = _env("XUI_USERNAME", "")
+XUI_PASSWORD = os.environ.get("XUI_PASSWORD", "").strip()
+XUI_VERIFY_SSL = _env("XUI_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
+XUI_WEB_BASE_PATH = _env("XUI_WEB_BASE_PATH", "")
+XUI_STATIC_CSRF_TOKEN = _env("XUI_STATIC_CSRF_TOKEN", "")
+XUI_INBOUND_ID = _env("XUI_INBOUND_ID", "1")
 
 
 async def main():

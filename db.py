@@ -17,10 +17,8 @@ from contextlib import contextmanager
 
 # По умолчанию база лежит рядом с кодом бота (как и раньше, т.к. systemd
 # запускает бота из этой же папки). Можно переопределить через DB_PATH.
-DB_PATH = os.environ.get(
-    "DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.db"),
-)
+DB_PATH = (os.environ.get("DB_PATH", "").split(" #")[0].strip()
+           or os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.db"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
