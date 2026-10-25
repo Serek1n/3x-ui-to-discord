@@ -85,6 +85,7 @@ class XUIClient:
 
         await self._start_browser()
         await self._login()
+        await self._park_page()
         return self
 
     async def _start_browser(self):
@@ -136,6 +137,44 @@ class XUIClient:
         except Exception:
             return False
 
+    # Лёгкая страница того же origin, что и панель: обычный JSON-ответ без JS
+    # и графиков. На ней вкладка «стоит» между операциями - так fetch() из
+    # _api_call продолжает работать (cookie и origin те же), а headless-Chromium
+    # не перерисовывает живые графики дашборда и не грузит CPU.
+    IDLE_PAGE_PATH = "/panel/api/inbounds/getClientTraffics/__idle__"
+
+    def _on_idle_page(self) -> bool:
+        try:
+            return bool(self._page) and self._page.url.startswith(
+                f"{self.base_url}{self.IDLE_PAGE_PATH}")
+        except Exception:
+            return False
+
+    async def _park_page(self):
+        """Уводит вкладку с тяжёлых страниц панели (дашборд, Clients) на
+        лёгкую страницу-заглушку. Ошибки не критичны - просто логируем."""
+        if not self._browser_alive() or self._on_idle_page():
+            return
+        # Если токен был только в <meta> текущей страницы - запоминаем его,
+        # пока мы ещё на ней (на JSON-странице meta уже не будет).
+        if not self._csrf_token:
+            try:
+                meta = await self._page.evaluate(
+                    "() => { const m = document.querySelector('meta[name=\"csrf-token\"]');"
+                    " return m ? m.getAttribute('content') : null; }"
+                )
+                if meta:
+                    self._csrf_token = meta
+            except Exception:
+                pass
+        try:
+            await self._page.goto(
+                f"{self.base_url}{self.IDLE_PAGE_PATH}",
+                timeout=self.timeout_ms, wait_until="domcontentloaded",
+            )
+        except Exception as e:
+            log.debug("Не удалось увести вкладку на страницу-заглушку: %s", e)
+
     async def _recover(self):
         """Восстановление после ошибки: перезапуск браузера, если он упал,
         или повторный вход, если сессия панели истекла."""
@@ -153,21 +192,26 @@ class XUIClient:
         восстанавливает сессию/браузер и повторяет."""
         async with self._lock:
             try:
-                return await fn(*args, **kwargs)
-            except XUIClientNotFound:
-                raise
-            except Exception as e:
-                log.warning("Операция %s не удалась (%s), пробую восстановить сессию", fn.__name__, e)
-                try:
-                    await self._recover()
-                except Exception as rec_e:
-                    raise XUIError(f"{e} (восстановить сессию не удалось: {rec_e})")
                 try:
                     return await fn(*args, **kwargs)
-                except XUIError:
+                except XUIClientNotFound:
                     raise
-                except Exception as e2:
-                    raise XUIError(str(e2))
+                except Exception as e:
+                    log.warning("Операция %s не удалась (%s), пробую восстановить сессию", fn.__name__, e)
+                    try:
+                        await self._recover()
+                    except Exception as rec_e:
+                        raise XUIError(f"{e} (восстановить сессию не удалось: {rec_e})")
+                    try:
+                        return await fn(*args, **kwargs)
+                    except XUIError:
+                        raise
+                    except Exception as e2:
+                        raise XUIError(str(e2))
+            finally:
+                # После любой операции (успешной или нет) не оставляем вкладку
+                # на дашборде/Clients - иначе живые графики грузят CPU сутками.
+                await self._park_page()
 
     async def close(self):
         for obj, method in ((self._context, "close"), (self._browser, "close"),
@@ -352,6 +396,15 @@ class XUIClient:
 
     async def _api_call(self, method: str, path: str, body=None):
         url = f"{self.base_url}{path}"
+        # fetch() должен идти со страницы панели (тот же origin и cookie).
+        try:
+            if self._page and not self._page.url.startswith(self.base_url):
+                await self._page.goto(
+                    f"{self.base_url}{self.IDLE_PAGE_PATH}",
+                    timeout=self.timeout_ms, wait_until="domcontentloaded",
+                )
+        except Exception:
+            pass
         script = """
         async ({method, url, body, presetToken}) => {
             function getCookie(name) {
