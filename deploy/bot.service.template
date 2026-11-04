@@ -1,0 +1,22 @@
+[Unit]
+Description=NEXUS VPN Discord bot (3x-ui)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+# .env читает сам бот (python-dotenv) - так комментарии и кавычки в .env
+# обрабатываются правильно.
+ExecStart=__APP_DIR__/.venv/bin/python -u __APP_DIR__/bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# Подробный лог бот пишет сам в bot.log с ротацией; сюда (journalctl)
+# попадают только запуск/остановка и аварийные ошибки.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

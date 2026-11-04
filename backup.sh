@@ -32,7 +32,9 @@ TAR="$TMP_DIR/backup.tar"
 tar --exclude="$NAME/.venv" \
     --exclude="$NAME/__pycache__" \
     --exclude="$NAME/subscriptions.db*" \
-    --exclude="$NAME/bot.log" \
+    --exclude="$NAME/bot.log*" \
+    --exclude="$NAME/.ready" \
+    --exclude="$NAME/.git" \
     -cf "$TAR" -C "$(dirname "$APP_DIR")" "$NAME"
 # Отдельно добавляем консистентную копию базы (её не задевают исключения выше).
 if [ ${#DB_ARGS[@]} -gt 0 ]; then

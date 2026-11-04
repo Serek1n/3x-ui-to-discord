@@ -49,27 +49,8 @@ echo "==> Проверяю подключение к 3x-ui (без запуск�
 }
 
 echo "==> Создаю systemd unit /etc/systemd/system/${SERVICE_NAME}.service"
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Discord bot for 3x-ui VPN subscriptions
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-WorkingDirectory=${APP_DIR}
-EnvironmentFile=${APP_DIR}/.env
-ExecStart=${APP_DIR}/.venv/bin/python -u ${APP_DIR}/bot.py
-Restart=always
-RestartSec=5
-TimeoutStopSec=20
-StandardOutput=append:${APP_DIR}/bot.log
-StandardError=append:${APP_DIR}/bot.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sed -e "s|__APP_DIR__|${APP_DIR}|g" -e "s|__USER__|${SERVICE_USER}|g" \
+    "$APP_DIR/deploy/bot.service.template" > "/etc/systemd/system/${SERVICE_NAME}.service"
 
 echo "==> Перечитываю конфигурацию systemd"
 systemctl daemon-reload
@@ -85,6 +66,7 @@ echo ""
 echo "Готово. Полезные команды:"
 echo "  sudo systemctl status ${SERVICE_NAME}      - статус"
 echo "  sudo systemctl restart ${SERVICE_NAME}     - перезапуск (например, после правки .env)"
-echo "  sudo journalctl -u ${SERVICE_NAME} -f       - логи в реальном времени"
-echo "  tail -f ${APP_DIR}/bot.log                 - логи бота (файл)"
+echo "  sudo journalctl -u ${SERVICE_NAME} -f       - запуск/остановка и аварийные ошибки"
+echo "  tail -f ${APP_DIR}/bot.log                 - логи бота (файл с ротацией)"
+echo "  sudo bash ${APP_DIR}/deploy.sh              - обновить бота из GitHub"
 echo "  ${APP_DIR}/.venv/bin/python ${APP_DIR}/test_connection.py  - проверка связи с 3x-ui отдельно"

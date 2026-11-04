@@ -3,5 +3,6 @@
 __pycache__/
 *.pyc
 subscriptions.db*
-bot.log
+bot.log*
+.ready
 login_debug_screenshot.png

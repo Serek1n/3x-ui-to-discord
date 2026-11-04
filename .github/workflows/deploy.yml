@@ -1,0 +1,43 @@
+# Автообновление бота на VPS после каждого Push в main.
+# Нужные секреты репозитория (Settings → Secrets and variables → Actions):
+#   VPS_HOST     - IP или домен сервера
+#   VPS_USER     - пользователь SSH (обычно root)
+#   VPS_SSH_KEY  - приватный SSH-ключ (весь текст файла)
+#   VPS_PORT     - порт SSH (необязательно, по умолчанию 22)
+#   VPS_APP_DIR  - папка бота (необязательно, по умолчанию /opt/3x-ui-to-discord)
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Проверка кода перед выкладкой
+        run: |
+          python -m py_compile *.py
+          bash -n deploy.sh backup.sh install_ubuntu.sh
+
+      - name: Обновление на VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 10m
+          script: bash "${{ secrets.VPS_APP_DIR || '/opt/3x-ui-to-discord' }}/deploy.sh"
