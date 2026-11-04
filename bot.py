@@ -838,8 +838,26 @@ def _draw_icon_box(draw: ImageDraw.ImageDraw, x: int, y: int, size: int,
 GREEN, YELLOW, RED, GRAY = (87, 242, 135), (250, 204, 21), (237, 66, 69), (130, 133, 145)
 
 
+def _paste_round_avatar(img: Image.Image, data: bytes, cx: int, cy: int, r: int) -> bool:
+    """Вклеивает картинку в круг радиуса r со сглаженным краем. False - не вышло."""
+    try:
+        av = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        return False
+    # Квадрат по центру с небольшим приближением (у логотипа широкие поля).
+    side = int(min(av.size) * 0.86)
+    left, top = (av.width - side) // 2, (av.height - side) // 2
+    av = av.crop((left, top, left + side, top + side)).resize((2 * r, 2 * r), Image.LANCZOS)
+    scale = 4  # маска в 4 раза больше и уменьшается - край круга без «лесенки»
+    mask = Image.new("L", (2 * r * scale, 2 * r * scale), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, 2 * r * scale - 1, 2 * r * scale - 1], fill=255)
+    mask = mask.resize((2 * r, 2 * r), Image.LANCZOS)
+    img.paste(av, (cx - r, cy - r), mask)
+    return True
+
+
 def _render_status_card(cpu_percent: float, mem, sent_speed: float, recv_speed: float,
-                         servers: list, requested_by: str) -> bytes:
+                         servers: list, requested_by: str, avatar: bytes | None = None) -> bytes:
     """Рисует PNG-карточку статуса (Pillow) - вызывается через asyncio.to_thread.
     Верх - нагрузка сервера, где работает бот; внизу по строке на каждый
     сервер: Xray и доступность из РФ.
@@ -865,15 +883,22 @@ def _render_status_card(cpu_percent: float, mem, sent_speed: float, recv_speed: 
     status_font = _find_font(24, bold=True)
     small_font = _find_font(16)
 
-    # Круглый аватар с буквой N
+    # Круглый аватар бота (если картинки нет - буква N)
     avatar_cx, avatar_cy, avatar_r = 140, 130, 70
-    draw.ellipse(
-        [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
-        outline=(60, 63, 72), width=2, fill=(20, 21, 27),
-    )
-    n_font = _find_font(64, bold=True)
-    n_w = draw.textlength("N", font=n_font)
-    draw.text((avatar_cx - n_w / 2, avatar_cy - 42), "N", font=n_font, fill=(235, 236, 240))
+    if avatar and _paste_round_avatar(img, avatar, avatar_cx, avatar_cy, avatar_r):
+        draw = ImageDraw.Draw(img)
+        draw.ellipse(
+            [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
+            outline=(60, 63, 72), width=2,
+        )
+    else:
+        draw.ellipse(
+            [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
+            outline=(60, 63, 72), width=2, fill=(20, 21, 27),
+        )
+        n_font = _find_font(64, bold=True)
+        n_w = draw.textlength("N", font=n_font)
+        draw.text((avatar_cx - n_w / 2, avatar_cy - 42), "N", font=n_font, fill=(235, 236, 240))
 
     # Заголовок + зелёная точка "онлайн" + подзаголовок
     title_x, title_y = 250, 78
@@ -1002,6 +1027,30 @@ def _sample_system_stats():
 
 
 _status_cooldowns: dict = {}
+_avatar_cache: dict = {}
+AVATAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "avatar.png")
+
+
+async def _bot_avatar() -> bytes | None:
+    """Текущая аватарка бота из Discord (кэш на час), иначе assets/avatar.png."""
+    cached = _avatar_cache.get("data")
+    if cached and time.time() - _avatar_cache.get("ts", 0) < 3600:
+        return cached
+    data = None
+    try:
+        if client.user is not None and client.user.avatar is not None:
+            data = await client.user.display_avatar.replace(size=256, static_format="png").read()
+    except Exception as e:
+        log.warning("Не удалось скачать аватарку бота: %s", e)
+    if not data:
+        try:
+            with open(AVATAR_FILE, "rb") as f:
+                data = f.read()
+        except OSError:
+            data = None
+    if data:
+        _avatar_cache.update(data=data, ts=time.time())
+    return data
 
 
 async def _collect_servers() -> list:
@@ -1059,7 +1108,7 @@ async def status_server_cmd(interaction: discord.Interaction):
 
     png_bytes = await asyncio.to_thread(
         _render_status_card, cpu_percent, mem, sent_speed, recv_speed,
-        servers, interaction.user.display_name,
+        servers, interaction.user.display_name, await _bot_avatar(),
     )
 
     try:
