@@ -41,6 +41,7 @@ import os
 import re
 import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 
@@ -836,6 +837,7 @@ def _draw_icon_box(draw: ImageDraw.ImageDraw, x: int, y: int, size: int,
 
 
 GREEN, YELLOW, RED, GRAY = (87, 242, 135), (250, 204, 21), (237, 66, 69), (130, 133, 145)
+MSK = timezone(timedelta(hours=3))
 
 
 def _paste_round_avatar(img: Image.Image, data: bytes, cx: int, cy: int, r: int) -> bool:
@@ -856,138 +858,203 @@ def _paste_round_avatar(img: Image.Image, data: bytes, cx: int, cy: int, r: int)
     return True
 
 
-def _render_status_card(cpu_percent: float, mem, sent_speed: float, recv_speed: float,
-                         servers: list, requested_by: str, avatar: bytes | None = None) -> bytes:
-    """Рисует PNG-карточку статуса (Pillow) - вызывается через asyncio.to_thread.
-    Верх - нагрузка сервера, где работает бот; внизу по строке на каждый
-    сервер: Xray и доступность из РФ.
-    servers: [{"name", "xray": True|False|None, "rf": RFResult|None, "note": str}]"""
-    servers = servers or [{"name": "Xray", "xray": False, "rf": None, "note": ""}]
-    W, H = 1300, 560 + 76 * (len(servers) - 1)
-    bg = (13, 14, 18)
-    card_border = (40, 42, 50)
-    text_dim = (150, 153, 163)
-    text_bright = (255, 255, 255)
-    icon_color = (137, 143, 255)
-    icon_box_fill = (26, 28, 38)
-    bar_start, bar_end = (99, 102, 241), (79, 172, 254)
+def _mix(color: tuple, bg: tuple, k: float) -> tuple:
+    return tuple(int(bg[i] + (color[i] - bg[i]) * k) for i in range(3))
 
-    img = Image.new("RGB", (W, H), bg)
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([1, 1, W - 2, H - 2], radius=28, outline=card_border, width=2, fill=(15, 16, 20))
 
-    title_font = _find_font(38, bold=True)
-    subtitle_font = _find_font(20)
-    label_font = _find_font(26, bold=True)
-    value_font = _find_font(24, bold=True)
-    status_font = _find_font(24, bold=True)
-    small_font = _find_font(16)
-
-    # Круглый аватар бота (если картинки нет - буква N)
-    avatar_cx, avatar_cy, avatar_r = 140, 130, 70
-    if avatar and _paste_round_avatar(img, avatar, avatar_cx, avatar_cy, avatar_r):
-        draw = ImageDraw.Draw(img)
-        draw.ellipse(
-            [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
-            outline=(60, 63, 72), width=2,
-        )
+def _draw_status_icon(draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, kind: str, color: tuple):
+    """Круглый значок: ok - галочка, bad - крестик, warn - «!», unknown - «?»."""
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+    ink = (14, 15, 20)
+    w = max(3, int(r / 3.2))
+    if kind == "ok":
+        draw.line([(cx - r * 0.45, cy + r * 0.02), (cx - r * 0.1, cy + r * 0.38), (cx + r * 0.5, cy - r * 0.35)],
+                  fill=ink, width=w, joint="curve")
+    elif kind == "bad":
+        k = r * 0.38
+        draw.line([(cx - k, cy - k), (cx + k, cy + k)], fill=ink, width=w)
+        draw.line([(cx - k, cy + k), (cx + k, cy - k)], fill=ink, width=w)
+    elif kind == "warn":
+        draw.line([(cx, cy - r * 0.5), (cx, cy + r * 0.12)], fill=ink, width=w)
+        draw.ellipse([cx - w / 2, cy + r * 0.32, cx + w / 2, cy + r * 0.32 + w], fill=ink)
     else:
-        draw.ellipse(
-            [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
-            outline=(60, 63, 72), width=2, fill=(20, 21, 27),
-        )
-        n_font = _find_font(64, bold=True)
-        n_w = draw.textlength("N", font=n_font)
-        draw.text((avatar_cx - n_w / 2, avatar_cy - 42), "N", font=n_font, fill=(235, 236, 240))
+        f = _find_font(int(r * 1.3), bold=True)
+        tw = draw.textlength("?", font=f)
+        draw.text((cx - tw / 2, cy - r * 0.78), "?", font=f, fill=ink)
 
-    # Заголовок + зелёная точка "онлайн" + подзаголовок
-    title_x, title_y = 250, 78
-    draw.text((title_x, title_y), "NEXUS_VPN", font=title_font, fill=text_bright)
-    title_w = draw.textlength("NEXUS_VPN", font=title_font)
-    dot_x = title_x + title_w + 22
-    dot_y = title_y + 20
-    draw.ellipse([dot_x - 9, dot_y - 9, dot_x + 9, dot_y + 9], fill=(87, 242, 135))
-    draw.text((title_x, title_y + 56), "Мониторинг в реальном времени", font=subtitle_font, fill=text_dim)
 
-    # Три колонки метрик: CPU / Память / Трафик
-    row_y = 250
-    icon_size = 56
-    col_x = [70, 480, 890]
-    col_w = 360
+def _draw_pill(draw, x: int, cy: int, text: str, kind: str, color: tuple, font, bg: tuple) -> int:
+    """Плашка «значок + слово». Возвращает ширину."""
+    h = 46
+    tw = draw.textlength(text, font=font)
+    w = int(tw + 70)
+    draw.rounded_rectangle([x, cy - h // 2, x + w, cy + h // 2], radius=h // 2,
+                           fill=_mix(color, bg, 0.16), outline=_mix(color, bg, 0.55), width=2)
+    _draw_status_icon(draw, x + 24, cy, 13, kind, color)
+    draw.text((x + 46, cy - 14), text, font=font, fill=color)
+    return w
 
-    # CPU
-    x = col_x[0]
-    _draw_icon_box(draw, x, row_y, icon_size, "cpu", icon_color, icon_box_fill)
-    draw.text((x + icon_size + 16, row_y + 12), "CPU", font=label_font, fill=text_bright)
-    cpu_val = f"{cpu_percent:.1f}%"
-    draw.text((x + col_w - draw.textlength(cpu_val, font=value_font), row_y + 14),
-              cpu_val, font=value_font, fill=(122, 162, 255))
-    _draw_gradient_bar(img, x, row_y + icon_size + 20, col_w, 14, cpu_percent, bar_start, bar_end)
-    draw = ImageDraw.Draw(img)  # ImageDraw объект нужно пересоздать после paste в _draw_gradient_bar
 
-    # Память
-    x = col_x[1]
-    _draw_icon_box(draw, x, row_y, icon_size, "memory", icon_color, icon_box_fill)
-    draw.text((x + icon_size + 16, row_y + 12), "Память", font=label_font, fill=text_bright)
-    mem_val = f"{mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} ГБ"
-    draw.text((x + col_w - draw.textlength(mem_val, font=value_font), row_y + 14),
-              mem_val, font=value_font, fill=(122, 162, 255))
-    _draw_gradient_bar(img, x, row_y + icon_size + 20, col_w, 14, mem.percent, bar_start, bar_end)
+def _load_level(cpu: float | None, mem_pct: float | None):
+    """Загрузка простыми словами по самому загруженному из процессора и памяти."""
+    vals = [v for v in (cpu, mem_pct) if isinstance(v, (int, float))]
+    if not vals:
+        return None, "Не знаю", GRAY
+    v = max(vals)
+    if v < 60:
+        return v, "Низкая", GREEN
+    if v < 85:
+        return v, "Средняя", YELLOW
+    return v, "Высокая", RED
+
+
+def card_summary(servers: list):
+    """Итог для шапки карточки: (вид, заголовок, подсказка)."""
+    broken = [sv["name"] for sv in servers if sv.get("xray") is False]
+    blocked = [sv["name"] for sv in servers
+               if sv.get("rf") is not None and sv["rf"].status in ("blocked", "partial")]
+    fine = [sv["name"] for sv in servers
+            if sv.get("xray") and (sv.get("rf") is None or sv["rf"].status == "ok")]
+    q = lambda names: ", ".join(f"«{n}»" for n in names)
+    if broken and not fine:
+        return "bad", "VPN не работает", "Мы уже знаем о проблеме и чиним. Попробуйте чуть позже."
+    if broken or blocked:
+        parts = []
+        if broken:
+            parts.append(f"{q(broken)} сломался, мы уже чиним.")
+        only_blocked = [n for n in blocked if n not in broken]
+        if only_blocked:
+            parts.append(f"{q(only_blocked)} сейчас не открывается из России.")
+        if fine:
+            parts.append(f"Подключайтесь к {q(fine)}: там всё хорошо.")
+        return "warn", "Работает, но не везде", " ".join(parts)
+    if any(sv.get("xray") is None for sv in servers):
+        return "warn", "Почти всё работает", "Про некоторые серверы пока нет данных."
+    return "ok", "Всё работает", "Можно спокойно подключаться к любому серверу."
+
+
+def _render_status_card(servers: list, requested_by: str, avatar: bytes | None = None,
+                         checked_at: datetime | None = None) -> bytes:
+    """PNG-карточка статуса простыми словами (Pillow, вызывается через to_thread).
+    servers: [{"name", "xray": True|False|None, "rf": RFResult|None,
+               "cpu": %, "mem": %, "down": байт/с, "up": байт/с}]"""
+    servers = servers or [{"name": "Сервер", "xray": None, "rf": None}]
+    W = 1300
+    row_h, row_gap = 84, 14
+    rows_y = 302
+    H = rows_y + len(servers) * (row_h + row_gap) + 70
+    bg = (15, 16, 20)
+    panel = (24, 25, 32)
+    text_dim = (150, 153, 163)
+    white = (255, 255, 255)
+    blue = (122, 162, 255)
+
+    img = Image.new("RGB", (W, H), (13, 14, 18))
     draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([1, 1, W - 2, H - 2], radius=28, outline=(40, 42, 50), width=2, fill=bg)
 
-    # Трафик
-    x = col_x[2]
-    _draw_icon_box(draw, x, row_y, icon_size, "traffic", icon_color, icon_box_fill)
-    draw.text((x + icon_size + 16, row_y + 12), "Трафик", font=label_font, fill=text_bright)
-    up_text = f"↑ {_fmt_speed(sent_speed)}"
-    down_text = f"↓ {_fmt_speed(recv_speed)}"
-    draw.text((x, row_y + icon_size + 12), up_text, font=value_font, fill=(122, 162, 255))
-    draw.text((x, row_y + icon_size + 44), down_text, font=value_font, fill=(122, 162, 255))
+    title_font = _find_font(40, bold=True)
+    sub_font = _find_font(21)
+    head_font = _find_font(19, bold=True)
+    name_font = _find_font(28, bold=True)
+    pill_font = _find_font(22, bold=True)
+    big_font = _find_font(30, bold=True)
+    hint_font = _find_font(23)
+    small_font = _find_font(17)
 
-    # Разделитель
-    divider_y = row_y + icon_size + 90
-    draw.line([(60, divider_y), (W - 60, divider_y)], fill=(40, 42, 50), width=1)
+    # Аватарка и название
+    acx, acy, ar = 118, 112, 62
+    if avatar and _paste_round_avatar(img, avatar, acx, acy, ar):
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([acx - ar, acy - ar, acx + ar, acy + ar], outline=(60, 63, 72), width=2)
+    else:
+        draw.ellipse([acx - ar, acy - ar, acx + ar, acy + ar], outline=(60, 63, 72), width=2, fill=(20, 21, 27))
+        n_font = _find_font(58, bold=True)
+        draw.text((acx - draw.textlength("N", font=n_font) / 2, acy - 38), "N", font=n_font, fill=(235, 236, 240))
+    draw.text((206, 62), "NEXUS VPN", font=title_font, fill=white)
+    draw.text((208, 118), "Как дела у серверов", font=sub_font, fill=text_dim)
 
-    # Строки серверов: Xray и доступность из РФ
-    row_h = 76
-    xray_y = divider_y + 30
+    # Главный итог - большой плашкой справа
+    kind, title, hint = card_summary(servers)
+    color = {"ok": GREEN, "warn": YELLOW, "bad": RED}[kind]
+    tw = draw.textlength(title, font=big_font)
+    pw, ph = int(tw + 96), 72
+    px, py = W - 60 - pw, 76
+    draw.rounded_rectangle([px, py, px + pw, py + ph], radius=ph // 2,
+                           fill=_mix(color, bg, 0.16), outline=_mix(color, bg, 0.6), width=2)
+    _draw_status_icon(draw, px + 38, py + ph / 2, 19, kind, color)
+    draw.text((px + 70, py + ph / 2 - 19), title, font=big_font, fill=color)
+
+    # Подсказка, что делать (до двух строк)
+    lines, cur = [], ""
+    for word in hint.split():
+        test = f"{cur} {word}".strip()
+        if draw.textlength(test, font=hint_font) <= W - 140:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    if len(lines) > 2:
+        lines = lines[:2]
+        lines[1] = lines[1][:-1] + "…"
+    for n, line in enumerate(lines):
+        draw.text((70, 184 + n * 32), line, font=hint_font, fill=(214, 216, 226))
+
+    # Заголовки колонок
+    cols = {"name": 70, "vpn": 330, "rf": 580, "load": 870, "speed": 1080}
+    hy = 262
+    for key, label in (("name", "СЕРВЕР"), ("vpn", "VPN"), ("rf", "ИЗ РОССИИ"),
+                       ("load", "ЗАГРУЗКА"), ("speed", "СКОРОСТЬ")):
+        draw.text((cols[key], hy), label, font=head_font, fill=(110, 113, 125))
+
     for i, sv in enumerate(servers):
-        y = xray_y + i * row_h
-        x = col_x[0]
-        _draw_icon_box(draw, x, y, icon_size, "pulse", icon_color, icon_box_fill)
+        top = rows_y + i * (row_h + row_gap)
+        cy = top + row_h // 2
+        draw.rounded_rectangle([50, top, W - 50, top + row_h], radius=18, fill=panel)
 
         name = str(sv.get("name") or "Сервер")
-        while draw.textlength(name, font=label_font) > 230 and len(name) > 4:
+        while draw.textlength(name, font=name_font) > cols["vpn"] - cols["name"] - 20 and len(name) > 4:
             name = name[:-2] + "…"
-        draw.text((x + icon_size + 16, y + 16), name, font=label_font, fill=text_bright)
-        sep_x = 390
-        draw.line([(sep_x, y + 8), (sep_x, y + icon_size - 8)], fill=(60, 62, 70), width=2)
+        draw.text((cols["name"], cy - 18), name, font=name_font, fill=white)
 
         xray = sv.get("xray")
-        x_color = GREEN if xray else (GRAY if xray is None else RED)
-        x_text = "Xray: работает" if xray else ("Xray: нет связи" if xray is None else "Xray: не запущен")
-        dot_x2, dot_y2 = sep_x + 24, y + icon_size / 2
-        draw.ellipse([dot_x2 - 8, dot_y2 - 8, dot_x2 + 8, dot_y2 + 8], fill=x_color)
-        draw.text((dot_x2 + 20, y + 16), x_text, font=status_font, fill=x_color)
+        if xray:
+            _draw_pill(draw, cols["vpn"], cy, "Работает", "ok", GREEN, pill_font, panel)
+        elif xray is False:
+            _draw_pill(draw, cols["vpn"], cy, "Не работает", "bad", RED, pill_font, panel)
+        else:
+            _draw_pill(draw, cols["vpn"], cy, "Нет связи", "unknown", GRAY, pill_font, panel)
 
         rf = sv.get("rf")
-        if rf is not None:
-            rf_sep = 700
-            draw.line([(rf_sep, y + 8), (rf_sep, y + icon_size - 8)], fill=(60, 62, 70), width=2)
-            r_color = {"ok": GREEN, "partial": YELLOW, "blocked": RED}.get(rf.status, GRAY)
-            dot_x3 = rf_sep + 24
-            draw.ellipse([dot_x3 - 8, dot_y2 - 8, dot_x3 + 8, dot_y2 + 8], fill=r_color)
-            draw.text((dot_x3 + 20, y + 16), f"РФ: {rf.label}", font=status_font, fill=r_color)
+        status = rf.status if rf is not None else "none"
+        text, k, c = {
+            "ok": ("Открывается", "ok", GREEN),
+            "partial": ("Не у всех", "warn", YELLOW),
+            "blocked": ("Не открывается", "bad", RED),
+            "unknown": ("Не проверено", "unknown", GRAY),
+            "none": ("Не проверено", "unknown", GRAY),
+        }[status]
+        _draw_pill(draw, cols["rf"], cy, text, k, c, pill_font, panel)
 
-        note = str(sv.get("note") or "")
-        if note:
-            while draw.textlength(note, font=small_font) > 250 and len(note) > 4:
-                note = note[:-2] + "…"
-            draw.text((W - 70 - draw.textlength(note, font=small_font), y + 22), note,
-                      font=small_font, fill=text_dim)
+        value, word, lc = _load_level(sv.get("cpu"), sv.get("mem"))
+        draw.text((cols["load"], cy - 24), word, font=pill_font, fill=lc)
+        bar_w = 160
+        draw.rounded_rectangle([cols["load"], cy + 10, cols["load"] + bar_w, cy + 20], radius=5, fill=(42, 44, 51))
+        if value is not None:
+            fill_w = max(10, int(bar_w * min(value, 100) / 100))
+            draw.rounded_rectangle([cols["load"], cy + 10, cols["load"] + fill_w, cy + 20], radius=5, fill=lc)
 
-    footer_y = xray_y + (len(servers) - 1) * row_h + icon_size + 20
-    draw.text((70, footer_y), f"Запрошено: {requested_by}", font=small_font, fill=(90, 92, 100))
+        down, up = sv.get("down"), sv.get("up")
+        if isinstance(down, (int, float)) and isinstance(up, (int, float)):
+            draw.text((cols["speed"], cy - 26), f"↓ {down * 8 / 1e6:.1f} Мбит/с", font=small_font, fill=blue)
+            draw.text((cols["speed"], cy + 4), f"↑ {up * 8 / 1e6:.1f} Мбит/с", font=small_font, fill=blue)
+        else:
+            draw.text((cols["speed"], cy - 10), "—", font=pill_font, fill=GRAY)
+
+    when = (checked_at or datetime.now(MSK)).astimezone(MSK).strftime("%H:%M")
+    draw.text((70, H - 48), f"Проверено в {when} по Москве · запросил {requested_by}",
+              font=small_font, fill=(95, 98, 108))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -1056,16 +1123,20 @@ async def _bot_avatar() -> bytes | None:
 async def _collect_servers() -> list:
     """Строки серверов для карточки: Xray доп. серверов через API и
     доступность всех серверов из РФ."""
-    servers = [{"name": primary.name, "xray": None, "rf": None, "note": "",
-                "target": primary.check_target}]
+    servers = [{"name": primary.name, "xray": None, "rf": None, "target": primary.check_target}]
     for panel in active_extras():
-        row = {"name": panel.name, "xray": None, "rf": None, "note": "", "target": panel.check_target}
+        row = {"name": panel.name, "xray": None, "rf": None, "target": panel.check_target}
         try:
             st = await panel.api.server_status()
             row["xray"] = str((st.get("xray") or {}).get("state", "")).lower() == "running"
             mem = st.get("mem") or {}
-            mem_pct = 100 * (mem.get("current") or 0) / (mem.get("total") or 1)
-            row["note"] = f"CPU {float(st.get('cpu') or 0):.0f}% · RAM {mem_pct:.0f}%"
+            if mem.get("total"):
+                row["mem"] = 100 * (mem.get("current") or 0) / mem["total"]
+            if st.get("cpu") is not None:
+                row["cpu"] = float(st["cpu"])
+            net = st.get("netIO") or {}
+            if net.get("down") is not None and net.get("up") is not None:
+                row["down"], row["up"] = float(net["down"]), float(net["up"])
         except XUIError as e:
             log.warning("Статус сервера «%s»: %s", panel.name, e)
         servers.append(row)
@@ -1104,11 +1175,12 @@ async def status_server_cmd(interaction: discord.Interaction):
     (cpu_percent, mem, sent_speed, recv_speed, xray_running), servers = await asyncio.gather(
         asyncio.to_thread(_sample_system_stats), _collect_servers(),
     )
-    servers[0]["xray"] = xray_running  # основной сервер - тот, где работает бот
+    # Основной сервер - тот, где работает бот: его цифры меряем на месте.
+    servers[0].update(xray=xray_running, cpu=cpu_percent, mem=mem.percent,
+                      down=recv_speed, up=sent_speed)
 
     png_bytes = await asyncio.to_thread(
-        _render_status_card, cpu_percent, mem, sent_speed, recv_speed,
-        servers, interaction.user.display_name, await _bot_avatar(),
+        _render_status_card, servers, interaction.user.display_name, await _bot_avatar(),
     )
 
     try:
