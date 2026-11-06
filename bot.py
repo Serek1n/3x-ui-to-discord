@@ -141,7 +141,8 @@ REISSUE_COOLDOWN_SEC = _env_int("REISSUE_COOLDOWN_SEC", "600")
 NEXUS_LINK_BASE = _env("NEXUS_LINK_BASE", "").rstrip("/")
 NEXUS_LINK_HOST = _env("NEXUS_LINK_HOST", "0.0.0.0")
 NEXUS_LINK_PORT = _env_int("NEXUS_LINK_PORT", "8444")
-# Сертификат и ключ (те же файлы, что у панели 3x-ui). Пусто - http (за nginx).
+# Сертификат и ключ (те же файлы, что у панели 3x-ui). Без них переходник
+# слушает только 127.0.0.1 - для варианта за nginx с https.
 NEXUS_LINK_CERT = _env("NEXUS_LINK_CERT", "")
 NEXUS_LINK_KEY = _env("NEXUS_LINK_KEY", "")
 # Где скачать Nexus - кнопка на странице переходника (необязательно).

@@ -6,8 +6,14 @@ https://<домен>:<порт>/add/<subId>, а эта страница сраз
 ссылкой nexus://import?url=<подписка>. Если Nexus не открылся - на странице
 есть повторная кнопка, ссылка на скачивание и копирование подписки.
 
-Страница отдаётся только для существующих подписок (subId есть в базе),
-поэтому переходник нельзя использовать, чтобы подсунуть чужую ссылку.
+Страница отдаётся только для подписок, которые есть в базе бота (subId
+известен), поэтому переходник нельзя использовать, чтобы подсунуть чужую
+ссылку. Запись истёкшего trial живёт в базе до часовой проверки - такая
+подписка откроется, но просто не загрузится.
+
+Без сертификата ссылка подписки шла бы по сети открытым текстом, поэтому
+без NEXUS_LINK_CERT/NEXUS_LINK_KEY сервер слушает только 127.0.0.1 (вариант
+«за nginx»), а если задан только один из двух файлов - не запускается.
 
 Сервер работает внутри бота (aiohttp уже есть в зависимостях discord.py).
 Сертификат - тот же, что у панели 3x-ui; файлы перечитываются раз в сутки,
@@ -186,12 +192,20 @@ class LinkServer:
         app.router.add_get("/logo.png", self.handle_logo)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
+        host = self.host
+        if bool(self.cert) != bool(self.key):
+            await self._runner.cleanup()
+            raise ValueError("нужны оба файла: NEXUS_LINK_CERT и NEXUS_LINK_KEY")
         if self.cert and self.key:
             self._ssl = self._make_ssl()
             self._reload_task = asyncio.create_task(self._reload_cert_loop())
-        site = web.TCPSite(self._runner, self.host, self.port, ssl_context=self._ssl)
+        elif host not in ("127.0.0.1", "localhost", "::1"):
+            log.warning("Сертификат не задан - переходник слушает только 127.0.0.1 "
+                        "(доступ снаружи - через nginx с https)")
+            host = "127.0.0.1"
+        site = web.TCPSite(self._runner, host, self.port, ssl_context=self._ssl)
         await site.start()
-        log.info("Переходник «Добавить в Nexus» слушает %s:%s (%s)", self.host, self.port,
+        log.info("Переходник «Добавить в Nexus» слушает %s:%s (%s)", host, self.port,
                  "HTTPS" if self._ssl else "HTTP")
 
     async def stop(self):
