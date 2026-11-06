@@ -59,6 +59,7 @@ import db  # noqa: E402  (после load_dotenv, чтобы учитывалс�
 from xui_client import XUIClient, XUIError  # noqa: E402
 from xui_api import XUIApi, recent_ips  # noqa: E402
 import rf_check  # noqa: E402
+from link_server import LinkServer  # noqa: E402
 
 log = logging.getLogger("nexus")
 
@@ -135,6 +136,16 @@ SHARING_CHECK = _env_bool("SHARING_CHECK", "true")
 SHARING_IP_THRESHOLD = _env_int("SHARING_IP_THRESHOLD", str(DEVICE_LIMIT + 2))
 # Не чаще одного перевыпуска ссылки за это время (секунд) на человека.
 REISSUE_COOLDOWN_SEC = _env_int("REISSUE_COOLDOWN_SEC", "600")
+# Кнопка «Добавить в Nexus»: публичный https-адрес переходника (домен и порт),
+# например https://nexuskvn.duckdns.org:8444. Пусто - кнопки нет.
+NEXUS_LINK_BASE = _env("NEXUS_LINK_BASE", "").rstrip("/")
+NEXUS_LINK_HOST = _env("NEXUS_LINK_HOST", "0.0.0.0")
+NEXUS_LINK_PORT = _env_int("NEXUS_LINK_PORT", "8444")
+# Сертификат и ключ (те же файлы, что у панели 3x-ui). Пусто - http (за nginx).
+NEXUS_LINK_CERT = _env("NEXUS_LINK_CERT", "")
+NEXUS_LINK_KEY = _env("NEXUS_LINK_KEY", "")
+# Где скачать Nexus - кнопка на странице переходника (необязательно).
+NEXUS_DOWNLOAD_URL = _env("NEXUS_DOWNLOAD_URL", "")
 # Лог с автоматической ротацией: bot.log до LOG_MAX_MB, LOG_BACKUPS старых копий.
 LOG_FILE = _env("LOG_FILE", "bot.log")
 LOG_MAX_MB = _env_int("LOG_MAX_MB", "5")
@@ -218,11 +229,16 @@ def active_extras() -> list:
     return [p for p in extra_panels if p.api is not None] if api_mode() else []
 
 
+link_server: LinkServer | None = None
+
+
 class VPNBot(discord.Client):
     async def setup_hook(self):
         await _setup()
 
     async def close(self):
+        if link_server is not None:
+            await link_server.stop()
         if xui is not None:
             await xui.close()
         await super().close()
@@ -242,6 +258,32 @@ def sub_link(sub_id: str) -> str:
         # Happ: TCP-пинг (без отключения туннеля) + привязка к happ-proxy.com.
         base += f"#?providerid={HAPP_PROVIDER_ID}&ping-type=tcp"
     return base
+
+
+def plain_sub_url(sub_id: str) -> str:
+    """Ссылка подписки без параметров Happ - для Nexus."""
+    return f"{XUI_SUB_BASE}/{sub_id}"
+
+
+def _sub_id_from_link(link: str) -> str:
+    return link.split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def nexus_button(sub_id: str) -> discord.ui.Button | None:
+    """Кнопка-ссылка «Добавить в Nexus» (через https-переходник)."""
+    if not NEXUS_LINK_BASE or not sub_id or link_server is None:
+        return None
+    return discord.ui.Button(style=discord.ButtonStyle.link, label="Добавить в Nexus", emoji="⚡",
+                             url=f"{NEXUS_LINK_BASE}/add/{sub_id}")
+
+
+def nexus_view(link: str | None) -> discord.ui.View | None:
+    button = nexus_button(_sub_id_from_link(link)) if link else None
+    if button is None:
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(button)
+    return view
 
 
 def make_qr_file(link: str, filename: str = "subscription_qr.png") -> discord.File:
@@ -291,7 +333,11 @@ async def send_dm(user, text: str, link: str | None = None):
     ЛС не считаются ошибкой."""
     try:
         if link:
-            await user.send(text, file=make_qr_file(link))
+            view = nexus_view(link)
+            if view is not None:
+                await user.send(text, file=make_qr_file(link), view=view)
+            else:
+                await user.send(text, file=make_qr_file(link))
         else:
             await user.send(text)
     except (discord.Forbidden, discord.HTTPException):
@@ -658,7 +704,11 @@ class ConfirmReissueView(discord.ui.View):
         _reissue_times[self.owner_id] = now
         text = ("Ссылка перевыпущена ✅ Старая и все добавленные по ней конфиги больше не работают.\n"
                 f"Добавьте новую подписку в приложение заново:\n{link}")
-        await interaction.followup.send(text, file=make_qr_file(link), ephemeral=True)
+        view = nexus_view(link)
+        if view is not None:
+            await interaction.followup.send(text, file=make_qr_file(link), view=view, ephemeral=True)
+        else:
+            await interaction.followup.send(text, file=make_qr_file(link), ephemeral=True)
         await send_dm(interaction.user, text, link)
         await notify_admin(f"🔁 {interaction.user} ({discord_id}) перевыпустил ссылку подписки")
 
@@ -668,10 +718,14 @@ class ConfirmReissueView(discord.ui.View):
 
 
 class MyVPNView(discord.ui.View):
-    def __init__(self, owner_id: int, can_reissue: bool):
+    def __init__(self, owner_id: int, can_reissue: bool, sub_id: str = ""):
         super().__init__(timeout=600)
         self.owner_id = owner_id
         self.add_item(GuideSelect())
+        button = nexus_button(sub_id)
+        if button is not None:
+            button.row = 1
+            self.add_item(button)
         if not can_reissue:
             self.reissue.disabled = True
 
@@ -744,7 +798,7 @@ async def myvpn(interaction: discord.Interaction):
     await interaction.followup.send(
         "\n".join(lines),
         file=make_qr_file(link),
-        view=MyVPNView(interaction.user.id, can_reissue=api_mode()),
+        view=MyVPNView(interaction.user.id, can_reissue=api_mode(), sub_id=sub["sub_id"]),
         ephemeral=True,
     )
 
@@ -1857,6 +1911,24 @@ async def _setup():
             log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
 
     client.add_view(TicketCloseView())  # кнопки «Закрыть обращение» после перезапуска
+
+    if NEXUS_LINK_BASE:
+        global link_server
+
+        def _sub_url_for(sub_id: str):
+            return plain_sub_url(sub_id) if db.get_subscription_by_sub_id(sub_id) else None
+
+        link_server = LinkServer(_sub_url_for, host=NEXUS_LINK_HOST, port=NEXUS_LINK_PORT,
+                                 cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
+                                 download_url=NEXUS_DOWNLOAD_URL, logo_path=AVATAR_FILE)
+        try:
+            await link_server.start()
+        except Exception as e:
+            # Без переходника бот работает дальше, просто кнопка будет вести в никуда.
+            log.error("Не удалось запустить переходник «Добавить в Nexus» на порту %s: %s",
+                      NEXUS_LINK_PORT, e)
+            await notify_admin(f"⚠️ Переходник «Добавить в Nexus» не запустился: {e}")
+            link_server = None
 
     if TEST_GUILD_ID:
         # Команды регистрируются только на этот сервер (мгновенно). Порядок

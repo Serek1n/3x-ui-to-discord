@@ -116,6 +116,12 @@ def get_subscription(discord_id):
         return dict(row) if row else None
 
 
+def get_subscription_by_sub_id(sub_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM subscriptions WHERE sub_id = ?", (sub_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def list_subscriptions():
     with get_conn() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM subscriptions").fetchall()]
