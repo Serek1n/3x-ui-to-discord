@@ -1917,7 +1917,15 @@ async def _setup():
         global link_server
 
         def _sub_url_for(sub_id: str):
-            return plain_sub_url(sub_id) if db.get_subscription_by_sub_id(sub_id) else None
+            # Только действующая подписка: не отключена и срок не вышел
+            # (expiry_ms = 0 - бессрочная).
+            sub = db.get_subscription_by_sub_id(sub_id)
+            if not sub or not sub.get("active"):
+                return None
+            exp = sub.get("expiry_ms") or 0
+            if exp and exp <= int(time.time() * 1000):
+                return None
+            return plain_sub_url(sub_id)
 
         link_server = LinkServer(_sub_url_for, host=NEXUS_LINK_HOST, port=NEXUS_LINK_PORT,
                                  cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
