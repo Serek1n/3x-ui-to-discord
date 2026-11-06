@@ -137,7 +137,7 @@ SHARING_IP_THRESHOLD = _env_int("SHARING_IP_THRESHOLD", str(DEVICE_LIMIT + 2))
 # Не чаще одного перевыпуска ссылки за это время (секунд) на человека.
 REISSUE_COOLDOWN_SEC = _env_int("REISSUE_COOLDOWN_SEC", "600")
 # Кнопка «Добавить в Nexus»: публичный https-адрес переходника (домен и порт),
-# например https://nexuskvn.duckdns.org:8444. Пусто - кнопки нет.
+# например https://vpn.example.com:8444. Пусто - кнопки нет.
 NEXUS_LINK_BASE = _env("NEXUS_LINK_BASE", "").rstrip("/")
 NEXUS_LINK_HOST = _env("NEXUS_LINK_HOST", "0.0.0.0")
 NEXUS_LINK_PORT = _env_int("NEXUS_LINK_PORT", "8444")
