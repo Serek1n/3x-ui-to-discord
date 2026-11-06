@@ -39,6 +39,48 @@ def nexus_deeplink(sub_url: str) -> str:
     return "nexus://import?url=" + quote(sub_url, safe="")
 
 
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+FONT_FILES = {"unbounded-cyrillic-700.woff2", "unbounded-latin-700.woff2"}
+
+# Цвета взяты с логотипа: индиго фона, синий, фиолетовый и розовый пиксели.
+CSS = """
+@font-face { font-family: "Unbounded"; font-weight: 700; font-display: swap;
+  src: url(/fonts/unbounded-cyrillic-700.woff2) format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116; }
+@font-face { font-family: "Unbounded"; font-weight: 700; font-display: swap;
+  src: url(/fonts/unbounded-latin-700.woff2) format("woff2");
+  unicode-range: U+0000-00FF, U+2000-206F, U+20AC, U+2122; }
+:root {
+  color-scheme: dark;
+  --bg: #0C0B2B; --line: #2B2969; --field: #13123C;
+  --text: #EEEDFF; --muted: #A9A7D8;
+  --blue: #4F7BFF; --violet: #8C5BFF; --pink: #FF5CC6;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  color: var(--text); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { width: 100%; max-width: 27rem; margin: 0 auto; padding: 48px 20px 40px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.mark {
+  width: 44px; height: 44px; border-radius: 12px; overflow: hidden; flex: none;
+  display: grid; place-items: center; background: #070726;
+  font: 700 22px/1 "Unbounded", system-ui, sans-serif; color: #fff;
+}
+.mark img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.word { font: 700 14px/1 "Unbounded", system-ui, sans-serif; letter-spacing: .04em; }
+h1 {
+  margin: 40px 0 12px; font: 700 29px/1.22 "Unbounded", system-ui, sans-serif;
+  letter-spacing: -.01em; text-wrap: balance;
+}
+.lead { margin: 0; color: var(--muted); font-size: 17px; }
+a { color: #CDBDFF; text-underline-offset: 3px; }
+a:hover { color: #fff; }
+:focus-visible { outline: 3px solid var(--pink); outline-offset: 3px; }
+"""
+
 PAGE = """<!doctype html>
 <html lang="ru">
 <head>
@@ -46,57 +88,81 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Добавить в Nexus</title>
-<style>
-:root {{ color-scheme: dark; }}
-* {{ box-sizing: border-box; }}
-body {{
-  margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-  padding: 24px 16px; background: #05061A; color: #E6E8FF;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  background-image: radial-gradient(circle at 15% 10%, rgba(47,107,255,.28), transparent 45%),
-                    radial-gradient(circle at 85% 90%, rgba(224,60,255,.24), transparent 45%);
+<style>{css}
+.status {{ display: flex; align-items: center; gap: 12px; margin: 28px 0 16px; font-size: 15px; min-height: 24px; }}
+.dots {{ display: inline-flex; gap: 5px; flex: none; }}
+.dots i {{ width: 8px; height: 8px; display: block; animation: blink 1.2s infinite step-end; }}
+.dots i:nth-child(1) {{ background: var(--blue); }}
+.dots i:nth-child(2) {{ background: var(--violet); animation-delay: .2s; }}
+.dots i:nth-child(3) {{ background: var(--pink); animation-delay: .4s; }}
+@keyframes blink {{ 50% {{ opacity: .25; }} }}
+.status.waited .dots i {{ animation: none; opacity: .3; }}
+.open {{
+  display: block; padding: 16px 20px; border-radius: 12px; text-align: center; text-decoration: none;
+  background: var(--violet); color: #fff; font-weight: 650; font-size: 17px;
 }}
-main {{ width: 100%; max-width: 440px; text-align: center; }}
-.logo {{
-  width: 96px; height: 96px; margin: 0 auto 20px; border-radius: 26px; display: flex;
-  align-items: center; justify-content: center; font-weight: 800; font-size: 50px; color: #fff;
-  background: linear-gradient(135deg, #3D6BFF 0%, #8B5CFF 55%, #FF5FD2 100%);
-  box-shadow: 0 0 40px rgba(139,92,255,.55); overflow: hidden;
+.open:hover {{ background: #7B47FF; color: #fff; }}
+.open:active {{ transform: translateY(1px); }}
+.help {{ margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--line); }}
+.help h2 {{ margin: 0 0 6px; font-size: 16px; font-weight: 650; }}
+.help p {{ margin: 0 0 10px; color: var(--muted); font-size: 15px; }}
+.field {{
+  display: flex; margin-top: 16px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--field); overflow: hidden;
 }}
-.logo img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-h1 {{ margin: 0 0 8px; font-size: 26px; }}
-p {{ margin: 0 0 22px; color: #AEB3D6; line-height: 1.5; }}
-.btn {{
-  display: block; width: 100%; padding: 16px 20px; margin-bottom: 12px; border-radius: 14px;
-  font-size: 17px; font-weight: 700; text-decoration: none; border: 0; cursor: pointer;
+.field input {{
+  flex: 1; min-width: 0; padding: 12px 14px; border: 0; background: transparent;
+  color: var(--text); font: inherit; font-size: 14px; text-overflow: ellipsis;
 }}
-.primary {{ color: #fff; background: linear-gradient(90deg, #4F7BFF, #B455FF 60%, #FF5FD2); }}
-.secondary {{ color: #E6E8FF; background: rgba(124,107,255,.12); border: 1px solid rgba(150,120,255,.4); }}
-.btn:focus-visible {{ outline: 3px solid #FF5FD2; outline-offset: 3px; }}
-small {{ display: block; margin-top: 18px; color: #7C82A8; line-height: 1.5; }}
-#done {{ min-height: 1.4em; color: #57F287; font-weight: 600; }}
+.field input:focus-visible {{ outline-offset: -3px; }}
+.field button {{
+  flex: none; padding: 0 16px; border: 0; border-left: 1px solid var(--line); background: transparent;
+  color: var(--text); font: inherit; font-size: 14px; font-weight: 650; cursor: pointer;
+}}
+.field button:hover {{ background: #1C1A52; }}
+@media (prefers-reduced-motion: reduce) {{ .dots i {{ animation: none; }} }}
 </style>
 </head>
 <body>
 <main>
-  <div class="logo" aria-hidden="true">{logo}</div>
-  <h1>Открываем Nexus…</h1>
-  <p>Приложение спросит, добавить ли подписку NEXUS VPN — нажмите «Добавить».</p>
-  <a class="btn primary" id="open" href="{deeplink}">Открыть в Nexus</a>
-  {download}
-  <button class="btn secondary" id="copy" type="button" data-link="{sub_url}">Скопировать ссылку подписки</button>
-  <div id="done" role="status" aria-live="polite"></div>
-  <small>Ничего не произошло? Значит, Nexus не установлен — скачайте его кнопкой выше.
-  Ссылку можно вставить в Nexus или Happ вручную: «+» → «Вставить из буфера».</small>
+  <div class="brand">
+    <span class="mark" aria-hidden="true">{logo}</span>
+    <span class="word">NEXUS VPN</span>
+  </div>
+
+  <h1>Добавляем подписку в&nbsp;Nexus</h1>
+  <p class="lead">Nexus откроется сам и спросит, добавить ли подписку. Нажмите «Добавить».</p>
+
+  <p class="status" id="status" role="status" aria-live="polite">
+    <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span id="status-text">Открываем приложение</span>
+  </p>
+
+  <a class="open" id="open" href="{deeplink}">Открыть Nexus</a>
+
+  <section class="help" aria-labelledby="help-title">
+    <h2 id="help-title">Nexus не открылся</h2>
+    <p>{download}</p>
+    <p>На iPhone Nexus пока нет. Скопируйте ссылку и добавьте её в Happ: «+», затем «Вставить из буфера».</p>
+    <div class="field">
+      <input id="link" type="text" readonly value="{sub_url}" aria-label="Ссылка подписки">
+      <button id="copy" type="button">Копировать</button>
+    </div>
+  </section>
 </main>
 <script>
-  setTimeout(function () {{ window.location.href = document.getElementById("open").href; }}, 300);
+  var open = document.getElementById("open");
+  setTimeout(function () {{ window.location.href = open.href; }}, 400);
+  setTimeout(function () {{
+    document.getElementById("status").classList.add("waited");
+    document.getElementById("status-text").textContent = "Окно не появилось? Нажмите кнопку ниже.";
+  }}, 3000);
   document.getElementById("copy").addEventListener("click", function () {{
-    var link = this.getAttribute("data-link"), done = document.getElementById("done");
-    function ok() {{ done.textContent = "Скопировано ✓"; }}
-    if (navigator.clipboard) {{
-      navigator.clipboard.writeText(link).then(ok, function () {{ window.prompt("Скопируйте ссылку:", link); }});
-    }} else {{ window.prompt("Скопируйте ссылку:", link); }}
+    var btn = this, input = document.getElementById("link");
+    function done() {{ btn.textContent = "Скопировано"; setTimeout(function () {{ btn.textContent = "Копировать"; }}, 2000); }}
+    if (navigator.clipboard && window.isSecureContext) {{
+      navigator.clipboard.writeText(input.value).then(done, function () {{ input.select(); }});
+    }} else {{ input.select(); document.execCommand("copy"); done(); }}
   }});
 </script>
 </body>
@@ -104,14 +170,25 @@ small {{ display: block; margin-top: 18px; color: #7C82A8; line-height: 1.5; }}
 """
 
 NOT_FOUND = """<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow"><title>Ссылка устарела</title>
-<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;
-background:#05061A;color:#E6E8FF;font-family:system-ui,sans-serif;text-align:center}
-p{color:#AEB3D6;max-width:420px;line-height:1.5}</style></head>
-<body><main><h1>Ссылка устарела</h1>
-<p>Эта подписка больше не действует (её перевыпустили или удалили). Откройте <b>/myvpn</b> в Discord и нажмите «Добавить в Nexus» ещё раз.</p>
-</main></body></html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Ссылка не работает</title>
+<style>{css}</style>
+</head>
+<body>
+<main>
+  <div class="brand">
+    <span class="mark" aria-hidden="true">{logo}</span>
+    <span class="word">NEXUS VPN</span>
+  </div>
+  <h1>Эта ссылка больше не&nbsp;работает</h1>
+  <p class="lead">Подписку перевыпустили или удалили. Откройте /myvpn в Discord и нажмите «Добавить в Nexus» ещё раз.</p>
+</main>
+</body>
+</html>
 """
 
 HEADERS = {
@@ -120,7 +197,7 @@ HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "X-Robots-Tag": "noindex, nofollow",
-    "Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+    "Content-Security-Policy": "default-src 'none'; img-src 'self'; font-src 'self'; style-src 'unsafe-inline'; "
                                "script-src 'unsafe-inline'; "
                                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 }
@@ -142,16 +219,21 @@ class LinkServer:
         self._ssl = None
         self._reload_task = None
 
+    def _logo(self) -> str:
+        return '<img src="/logo.png" alt="">' if self.logo_path else "N"
+
     def _render(self, sub_url: str) -> str:
-        download = ""
         if self.download_url:
-            download = (f'<a class="btn secondary" href="{html.escape(self.download_url, quote=True)}" '
-                        f'rel="noopener">Скачать Nexus</a>')
+            download = (f'<a href="{html.escape(self.download_url, quote=True)}" rel="noopener">'
+                        f'Скачайте Nexus для Android или Windows</a>, установите и нажмите «Открыть Nexus» ещё раз.')
+        else:
+            download = "Установите Nexus и нажмите «Открыть Nexus» ещё раз."
         return PAGE.format(
+            css=CSS,
             deeplink=html.escape(nexus_deeplink(sub_url), quote=True),
             sub_url=html.escape(sub_url, quote=True),
             download=download,
-            logo='<img src="/logo.png" alt="">' if self.logo_path else "N",
+            logo=self._logo(),
         )
 
     async def handle_logo(self, request: web.Request):
@@ -163,8 +245,17 @@ class LinkServer:
         sub_id = request.match_info.get("sub_id", "")
         sub_url = self.sub_url_for(sub_id) if SUB_ID_RE.match(sub_id) else None
         if not sub_url:
-            return web.Response(text=NOT_FOUND, status=404, content_type="text/html", headers=HEADERS)
+            return web.Response(text=NOT_FOUND.format(css=CSS, logo=self._logo()), status=404,
+                                content_type="text/html", headers=HEADERS)
         return web.Response(text=self._render(sub_url), content_type="text/html", headers=HEADERS)
+
+    async def handle_font(self, request: web.Request):
+        name = request.match_info.get("name", "")
+        path = os.path.join(FONTS_DIR, name)
+        if name not in FONT_FILES or not os.path.isfile(path):
+            raise web.HTTPNotFound()
+        return web.FileResponse(path, headers={"Cache-Control": "public, max-age=2592000",
+                                               "Content-Type": "font/woff2"})
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.Response(text="ok", headers={"Cache-Control": "no-store"})
@@ -190,6 +281,7 @@ class LinkServer:
         app.router.add_get("/add/{sub_id}", self.handle_add)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/logo.png", self.handle_logo)
+        app.router.add_get("/fonts/{name}", self.handle_font)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         host = self.host
