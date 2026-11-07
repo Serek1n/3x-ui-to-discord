@@ -13,7 +13,8 @@ Discord-бот для выдачи и управления VPN-подписка�
     /ips @user          - [Админ] IP-адреса подключений пользователя (режим API)
 
 Доступ управляется ролями (Boosty сам выдаёт/снимает роль подписчикам):
-    роль VPN_ROLE_NAME   -> бессрочная платная подписка, пока роль есть;
+    роль VPN_ROLE_NAME   -> бессрочная платная подписка (Boosty), пока роль есть;
+    роли VPN_GIFT_ROLES  -> то же самое, но выданное вручную (розыгрыши, подарки);
     роль TRIAL_ROLE_NAME -> пробный период на TRIAL_DAYS дней, один раз на человека;
     ни одной роли        -> клиент удаляется из 3x-ui.
 
@@ -109,6 +110,11 @@ TEST_GUILD_ID = _env("TEST_GUILD_ID", "")
 
 # Одна универсальная роль вместо тарифных: пока она есть - VPN работает.
 VPN_ROLE_NAME = _env("VPN_ROLE_NAME", "VPN Access")
+# Роли, которые дают такой же постоянный доступ, но выдаются вручную - для
+# розыгрышей и подарков (Boosty их не трогает). Несколько - через запятую.
+VPN_GIFT_ROLES = {r.strip() for r in _env("VPN_GIFT_ROLES", "").split(",") if r.strip()}
+# Любая из этих ролей = платный (бессрочный) доступ.
+PAID_ROLES = {VPN_ROLE_NAME} | VPN_GIFT_ROLES
 # Роль разового пробного доступа.
 TRIAL_ROLE_NAME = _env("TRIAL_ROLE_NAME", "VPN Trial")
 
@@ -312,7 +318,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
 def can_view_status(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
-    return bool(_role_names(interaction.user) & {ADMIN_ROLE_NAME, VPN_ROLE_NAME, TRIAL_ROLE_NAME})
+    return bool(_role_names(interaction.user) & {ADMIN_ROLE_NAME, TRIAL_ROLE_NAME} | PAID_ROLES)
 
 
 def find_member(user_id: int):
@@ -323,7 +329,7 @@ def find_member(user_id: int):
         m = g.get_member(user_id)
         if m is None:
             continue
-        if _role_names(m) & {VPN_ROLE_NAME, TRIAL_ROLE_NAME}:
+        if _role_names(m) & PAID_ROLES | {TRIAL_ROLE_NAME}:
             return m
         fallback = fallback or m
     return fallback
@@ -545,7 +551,7 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
     actions = []
     async with _member_lock(discord_id):
         names = _role_names(member)
-        has_vpn = VPN_ROLE_NAME in names
+        has_vpn = bool(names & PAID_ROLES)
         has_trial = TRIAL_ROLE_NAME in names
         sub = db.get_subscription(discord_id)
 
@@ -564,12 +570,19 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
                 await _delete_sub(sub)
             link = await _create_sub(discord_id, "paid", member=member)
             actions.append("upgraded" if upgraded else "granted")
+            boosty = VPN_ROLE_NAME in names
+            role = VPN_ROLE_NAME if boosty else sorted(names & VPN_GIFT_ROLES)[0]
+            if boosty:
+                head = "Оплата на Boosty получена, спасибо! ✅"
+            else:
+                head = "Вам выдан доступ к NEXUS VPN 🎉"
+            if upgraded:
+                head += (" Пробный доступ заменён на постоянный.\n"
+                         "Старая ссылка больше не работает, добавьте новую:")
             text = (
-                ("Оплата на Boosty получена, спасибо! ✅ Пробный доступ заменён на постоянный.\n"
-                 "Старая ссылка больше не работает - добавьте новую:\n" if upgraded else
-                 "Оплата на Boosty получена, спасибо! ✅\n")
-                + f"VPN активен, пока у вас есть роль «{VPN_ROLE_NAME}». "
-                  f"Можно подключить до {DEVICE_LIMIT} устройств.\nСсылка: {link}"
+                f"{head}\n"
+                f"VPN активен, пока у вас есть роль «{role}». "
+                f"Можно подключить до {DEVICE_LIMIT} устройств.\nСсылка: {link}"
             )
             await send_dm(member, text, link)
             return actions
@@ -579,9 +592,9 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
             await _delete_sub(sub)
             sub = None
             actions.append("revoked")
-            await send_dm(member, f"Роль «{VPN_ROLE_NAME}» снята, доступ к VPN отозван.\n"
-                                  f"Если это ошибка или вы продолжаете оплачивать подписку - "
-                                  f"напишите администратору.")
+            await send_dm(member, "Роль доступа к NEXUS VPN снята, VPN отключён.\n"
+                                  "Если это ошибка или вы продолжаете оплачивать подписку на Boosty, "
+                                  "напишите в /support.")
 
         # 3. Пробный период.
         if has_trial:
@@ -764,7 +777,7 @@ async def myvpn(interaction: discord.Interaction):
         # выключен в момент выдачи роли) - выдаём прямо сейчас.
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         member = member or find_member(interaction.user.id)
-        if member and _role_names(member) & {VPN_ROLE_NAME, TRIAL_ROLE_NAME}:
+        if member and _role_names(member) & PAID_ROLES | {TRIAL_ROLE_NAME}:
             await _safe_sync(member, quiet=True)
             sub = db.get_subscription(discord_id)
 
@@ -1283,7 +1296,7 @@ async def revoke(interaction: discord.Interaction, member: discord.Member, remov
 
         roles_note = ""
         if remove_roles:
-            to_remove = [r for r in member.roles if r.name in (VPN_ROLE_NAME, TRIAL_ROLE_NAME)]
+            to_remove = [r for r in member.roles if r.name in PAID_ROLES | {TRIAL_ROLE_NAME}]
             if to_remove:
                 try:
                     await member.remove_roles(*to_remove, reason=f"/revoke от {interaction.user}")
@@ -1634,7 +1647,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     замечает это и приводит VPN-доступ в соответствие."""
     before_names = _role_names(before)
     after_names = _role_names(after)
-    watched = {VPN_ROLE_NAME, TRIAL_ROLE_NAME}
+    watched = PAID_ROLES | {TRIAL_ROLE_NAME}
     if (before_names ^ after_names) & watched:
         trial_just_added = TRIAL_ROLE_NAME in after_names and TRIAL_ROLE_NAME not in before_names
         await _safe_sync(after, trial_just_added=trial_just_added)
@@ -1690,7 +1703,7 @@ async def reconcile() -> Counter:
         return stats
 
     async with _reconcile_lock:
-        watched = {VPN_ROLE_NAME, TRIAL_ROLE_NAME}
+        watched = PAID_ROLES | {TRIAL_ROLE_NAME}
         members: dict = {}
         all_chunked = True
         roles_exist = False
@@ -1713,8 +1726,9 @@ async def reconcile() -> Counter:
 
         if not roles_exist:
             # Роль переименовали/удалили - не трогаем подписки, иначе удалили бы всех.
-            await notify_admin(f"⚠️ Сверка пропущена: на сервере нет ролей «{VPN_ROLE_NAME}» / "
-                               f"«{TRIAL_ROLE_NAME}». Проверьте VPN_ROLE_NAME/TRIAL_ROLE_NAME.",
+            names = ", ".join(f"«{r}»" for r in sorted(PAID_ROLES | {TRIAL_ROLE_NAME}))
+            await notify_admin(f"⚠️ Сверка пропущена: на сервере нет ни одной из ролей {names}. "
+                               f"Проверьте VPN_ROLE_NAME, VPN_GIFT_ROLES и TRIAL_ROLE_NAME.",
                                key="no_roles")
             stats.update(skipped=1)
             stats["reason"] = "на сервере нет VPN-ролей"
