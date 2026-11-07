@@ -33,7 +33,33 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     active        INTEGER NOT NULL DEFAULT 1,
     auto_renew    INTEGER NOT NULL DEFAULT 0,
     kind          TEXT NOT NULL DEFAULT 'paid',
-    reminders     INTEGER NOT NULL DEFAULT 0
+    reminders     INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT ''
+);
+"""
+
+# Журнал событий для статистики (/vpn_stats).
+#   kind:   trial_start | paid_start | trial_to_paid | end
+#   source: trial | boosty | gift | unknown (для end - источник закончившейся подписки)
+#   detail: для end - причина: role_removed | trial_expired | left | admin | trial_role_removed
+EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    ts          INTEGER NOT NULL
+);
+"""
+
+# Ответы на опрос «почему не купили» после пробного периода (последний ответ человека).
+SURVEY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS survey (
+    discord_id  TEXT PRIMARY KEY,
+    reason      TEXT NOT NULL,
+    comment     TEXT NOT NULL DEFAULT '',
+    ts          INTEGER NOT NULL
 );
 """
 
@@ -90,21 +116,44 @@ def init_db():
         conn.execute(SCHEMA)
         conn.execute(TRIALS_SCHEMA)
         conn.execute(TICKETS_SCHEMA)
+        conn.execute(EVENTS_SCHEMA)
+        conn.execute(SURVEY_SCHEMA)
+        conn.execute("CREATE INDEX IF NOT EXISTS events_kind_ts ON events (kind, ts)")
         # Миграции для баз, созданных старыми версиями бота.
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN auto_renew INTEGER NOT NULL DEFAULT 0")
         if _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN kind TEXT NOT NULL DEFAULT 'paid'"):
             # Старые записи: со сроком - это trial, без срока - платные.
             conn.execute("UPDATE subscriptions SET kind = 'trial' WHERE expiry_ms > 0")
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN reminders INTEGER NOT NULL DEFAULT 0")
+        _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        _backfill_events(conn)
 
 
-def create_subscription(discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, kind="paid"):
+def _backfill_events(conn):
+    """Первый запуск со статистикой: восстанавливаем историю из того, что
+    уже есть в базе (пробные периоды и текущие платные подписки)."""
+    if conn.execute("SELECT 1 FROM events LIMIT 1").fetchone():
+        return
+    trials = {r["discord_id"]: r["used_at"] for r in conn.execute("SELECT * FROM trials")}
+    for did, ts in trials.items():
+        conn.execute("INSERT INTO events (discord_id, kind, source, ts) VALUES (?, 'trial_start', 'trial', ?)",
+                     (did, ts))
+    for r in conn.execute("SELECT * FROM subscriptions WHERE kind = 'paid'").fetchall():
+        kind = "trial_to_paid" if r["discord_id"] in trials and r["created_at"] >= trials[r["discord_id"]] \
+            else "paid_start"
+        conn.execute("INSERT INTO events (discord_id, kind, source, ts) VALUES (?, ?, 'unknown', ?)",
+                     (r["discord_id"], kind, r["created_at"]))
+
+
+def create_subscription(discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, kind="paid",
+                        source=""):
     with get_conn() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO subscriptions
-               (discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, created_at, active, auto_renew, kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)""",
-            (discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, int(time.time()), kind),
+               (discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, created_at, active, auto_renew,
+                kind, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)""",
+            (discord_id, email, client_uuid, sub_id, inbound_id, expiry_ms, int(time.time()), kind, source),
         )
 
 
@@ -243,3 +292,70 @@ def close_ticket(thread_id):
 def count_open_tickets():
     with get_conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'").fetchone()[0]
+
+
+# ---------- статистика ----------
+
+PURCHASE_SOURCES = ("boosty", "unknown")  # unknown - подписки до появления статистики
+
+
+def log_event(discord_id, kind, source="", detail="", ts=None):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO events (discord_id, kind, source, detail, ts) VALUES (?, ?, ?, ?, ?)",
+            (discord_id, kind, source, detail, int(ts if ts is not None else time.time())),
+        )
+
+
+def paid_by_source():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT source, COUNT(*) AS n FROM subscriptions WHERE kind = 'paid' GROUP BY source").fetchall()
+        return {r["source"]: r["n"] for r in rows}
+
+
+def conversion_stats(since_ts=0):
+    """Цифры за период с since_ts (0 - за всё время)."""
+    q = ",".join("?" * len(PURCHASE_SOURCES))
+    with get_conn() as conn:
+        one = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
+        trials = one("SELECT COUNT(DISTINCT discord_id) FROM events WHERE kind = 'trial_start' AND ts >= ?",
+                     since_ts)
+        # Купили после пробного: начали trial в периоде и позже купили на Boosty.
+        converted = conn.execute(
+            f"""SELECT COUNT(DISTINCT t.discord_id) FROM events t
+                JOIN events p ON p.discord_id = t.discord_id
+                 AND p.kind IN ('trial_to_paid', 'paid_start') AND p.source IN ({q}) AND p.ts >= t.ts
+                WHERE t.kind = 'trial_start' AND t.ts >= ?""",
+            (*PURCHASE_SOURCES, since_ts)).fetchone()[0]
+        new_boosty = one(f"SELECT COUNT(*) FROM events WHERE kind IN ('paid_start', 'trial_to_paid') "
+                         f"AND source IN ({q}) AND ts >= ?", *PURCHASE_SOURCES, since_ts)
+        new_gift = one("SELECT COUNT(*) FROM events WHERE kind IN ('paid_start', 'trial_to_paid') "
+                       "AND source = 'gift' AND ts >= ?", since_ts)
+        churn = one(f"SELECT COUNT(*) FROM events WHERE kind = 'end' AND source IN ({q}) AND ts >= ?",
+                    *PURCHASE_SOURCES, since_ts)
+        trial_lost = one("SELECT COUNT(*) FROM events WHERE kind = 'end' AND detail = 'trial_expired' "
+                         "AND ts >= ?", since_ts)
+    return {"trials": trials, "converted": converted, "new_boosty": new_boosty, "new_gift": new_gift,
+            "churn": churn, "trial_lost": trial_lost}
+
+
+def save_survey(discord_id, reason, comment=""):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO survey (discord_id, reason, comment, ts) VALUES (?, ?, ?, ?)",
+            (discord_id, reason, comment, int(time.time())),
+        )
+
+
+def survey_counts():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT reason, COUNT(*) AS n FROM survey GROUP BY reason").fetchall()
+        return {r["reason"]: r["n"] for r in rows}
+
+
+def survey_comments(limit=5):
+    with get_conn() as conn:
+        rows = conn.execute("SELECT comment FROM survey WHERE comment != '' ORDER BY ts DESC LIMIT ?",
+                            (limit,)).fetchall()
+        return [r["comment"] for r in rows]

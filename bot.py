@@ -415,7 +415,7 @@ async def _create_on_extras(email: str, expiry_time: int, comment: str) -> dict:
     return subs
 
 
-async def _create_sub(discord_id: str, kind: str, *, member=None) -> str:
+async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = "") -> str:
     """Создаёт клиента на всех серверах и запись в БД. Возвращает ссылку подписки."""
     email = _email(discord_id)
     comment = f"discord: {member}" if member is not None else ""
@@ -434,20 +434,30 @@ async def _create_sub(discord_id: str, kind: str, *, member=None) -> str:
         created = await xui.add_client(XUI_INBOUND_ID, email, days, ip_limit=DEVICE_LIMIT)
     db.create_subscription(
         discord_id, email, created["uuid"], created["subId"],
-        XUI_INBOUND_ID, created["expiryMs"], kind=kind,
+        XUI_INBOUND_ID, created["expiryMs"], kind=kind, source=source or kind,
     )
     _extras_checked.add(discord_id)
     log.info("Выдана подписка %s пользователю %s", kind, discord_id)
     return sub_link(created["subId"])
 
 
-async def _delete_sub(sub: dict):
+def _sub_source(sub: dict) -> str:
+    if sub.get("source"):
+        return sub["source"]
+    return "trial" if sub.get("kind") == "trial" else "unknown"
+
+
+async def _delete_sub(sub: dict, reason: str = ""):
     """Удаляет клиента со всех серверов (сначала дополнительные: если там
-    ошибка, запись в БД остаётся и удаление повторится при сверке)."""
+    ошибка, запись в БД остаётся и удаление повторится при сверке).
+    reason - причина для статистики (пусто - не считается окончанием,
+    например при замене trial на платную)."""
     for panel in active_extras():
         await panel.api.delete_client(0, "", email=sub["email"])
     await xui.delete_client(sub["inbound_id"], sub["client_uuid"], email=sub["email"])
     db.delete_subscription(sub["discord_id"])
+    if reason:
+        db.log_event(sub["discord_id"], "end", source=_sub_source(sub), detail=reason)
     _extras_checked.discard(sub["discord_id"])
     log.info("Удалена подписка %s пользователя %s", sub.get("kind"), sub["discord_id"])
 
@@ -568,9 +578,11 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
                 # Был trial: панель не даёт редактировать клиента запросом,
                 # поэтому пересоздаём его уже бессрочным.
                 await _delete_sub(sub)
-            link = await _create_sub(discord_id, "paid", member=member)
-            actions.append("upgraded" if upgraded else "granted")
             boosty = VPN_ROLE_NAME in names
+            source = "boosty" if boosty else "gift"
+            link = await _create_sub(discord_id, "paid", member=member, source=source)
+            db.log_event(discord_id, "trial_to_paid" if upgraded else "paid_start", source=source)
+            actions.append("upgraded" if upgraded else "granted")
             role = VPN_ROLE_NAME if boosty else sorted(names & VPN_GIFT_ROLES)[0]
             if boosty:
                 head = "Оплата на Boosty получена, спасибо! ✅"
@@ -589,7 +601,7 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
 
         # 2. Платной роли нет, а платная подписка осталась - отзываем.
         if sub and sub["kind"] == "paid":
-            await _delete_sub(sub)
+            await _delete_sub(sub, reason="role_removed")
             sub = None
             actions.append("revoked")
             await send_dm(member, "Роль доступа к NEXUS VPN снята, VPN отключён.\n"
@@ -606,9 +618,10 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
                     await send_dm(member, "Пробный период уже был использован и доступен только один раз. "
                                           "Оформите подписку на Boosty, чтобы получить постоянный доступ.")
                 return actions
-            link = await _create_sub(discord_id, "trial", member=member)
+            link = await _create_sub(discord_id, "trial", member=member, source="trial")
             # Помечаем использованным только после успешной выдачи.
             db.mark_trial_used(discord_id)
+            db.log_event(discord_id, "trial_start", source="trial")
             actions.append("trial")
             await send_dm(
                 member,
@@ -623,7 +636,7 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
 
         # 4. Ролей нет, а trial-подписка осталась (роль Trial сняли вручную).
         if sub:
-            await _delete_sub(sub)
+            await _delete_sub(sub, reason="trial_role_removed")
             actions.append("revoked")
             await send_dm(member, "Роль пробного периода снята, доступ к VPN отозван.")
         return actions
@@ -1289,7 +1302,7 @@ async def revoke(interaction: discord.Interaction, member: discord.Member, remov
         sub = db.get_subscription(discord_id)
         if sub:
             try:
-                await _delete_sub(sub)
+                await _delete_sub(sub, reason="admin")
             except XUIError as e:
                 await interaction.followup.send(f"Ошибка при удалении в 3x-ui: `{e}`", ephemeral=True)
                 return
@@ -1337,19 +1350,59 @@ async def reset_trial_cmd(interaction: discord.Interaction, member: discord.Memb
     )
 
 
-@tree.command(name="vpn_stats", description="[Админ] Количество подписок")
+def _pct(part: int, whole: int) -> str:
+    return f"{round(100 * part / whole)}%" if whole else "—"
+
+
+def stats_text() -> str:
+    counts = db.count_subscriptions()
+    by_src = db.paid_by_source()
+    boosty = by_src.get("boosty", 0) + by_src.get("unknown", 0) + by_src.get("", 0) + by_src.get("paid", 0)
+    gift = by_src.get("gift", 0)
+    m = db.conversion_stats(int(time.time()) - 30 * 86400)
+    a = db.conversion_stats(0)
+    lines = [
+        "📊 **Статистика NEXUS VPN**",
+        "",
+        "**Сейчас**",
+        f"Платных: {counts.get('paid', 0)} (Boosty {boosty}, розыгрыши {gift})",
+        f"Пробных: {counts.get('trial', 0)}",
+        "",
+        "**За 30 дней**",
+        f"Начали пробный: {m['trials']}",
+        f"Купили после пробного: {m['converted']} ({_pct(m['converted'], m['trials'])})",
+        f"Пробный закончился без покупки: {m['trial_lost']}",
+        f"Новых на Boosty всего: {m['new_boosty']}",
+        f"Получили доступ за розыгрыш: {m['new_gift']}",
+        f"Ушли с Boosty: {m['churn']}",
+        "",
+        "**За всё время**",
+        f"Пробных: {a['trials']}, купили после пробного: {a['converted']} ({_pct(a['converted'], a['trials'])})",
+    ]
+    survey = db.survey_counts()
+    total = sum(survey.values())
+    if total:
+        lines += ["", f"**Почему не купили после пробного** (ответов: {total})"]
+        for key, label in SURVEY_REASONS.items():
+            if survey.get(key):
+                lines.append(f"{label}: {survey[key]} ({_pct(survey[key], total)})")
+        comments = db.survey_comments(3)
+        if comments:
+            lines.append("Последние комментарии: " + " / ".join(f"«{c[:120]}»" for c in comments))
+    lines += [
+        "",
+        f"Открытых обращений: {db.count_open_tickets()}. Панель: {'API' if api_mode() else 'браузер'}, "
+        "серверы: " + ", ".join([primary.name] + [p.name for p in active_extras()]),
+    ]
+    return "\n".join(lines)[:1990]
+
+
+@tree.command(name="vpn_stats", description="[Админ] Подписки, конверсия пробного периода и опрос")
 async def vpn_stats_cmd(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
         return
-    counts = db.count_subscriptions()
-    await interaction.response.send_message(
-        f"Платных подписок: {counts.get('paid', 0)}\nПробных подписок: {counts.get('trial', 0)}\n"
-        f"Открытых обращений: {db.count_open_tickets()}\n"
-        f"Режим панели: {'API' if api_mode() else 'браузер'}; серверы: "
-        + ", ".join([primary.name] + [p.name for p in active_extras()]),
-        ephemeral=True,
-    )
+    await interaction.response.send_message(stats_text(), ephemeral=True)
 
 
 @tree.error
@@ -1367,6 +1420,69 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.response.send_message(text, ephemeral=True)
     except discord.HTTPException:
         pass
+
+
+# ---------- опрос после пробного периода ----------
+
+SURVEY_REASONS = {
+    "price": "Дорого",
+    "slow": "Медленно или нестабильно",
+    "connect": "Не получилось подключить",
+    "notneeded": "Пока не нужен",
+    "other": "Другое",
+}
+
+
+async def _save_survey(interaction: discord.Interaction, reason: str, comment: str = ""):
+    db.save_survey(str(interaction.user.id), reason, comment)
+    text = f"🗳 Опрос после trial: {interaction.user} ({interaction.user.id}) — {SURVEY_REASONS[reason]}"
+    if comment:
+        text += f": «{comment[:500]}»"
+    await notify_admin(text)
+    log.info("Ответ на опрос от %s: %s", interaction.user.id, reason)
+
+
+def _survey_answered_text(message: discord.Message | None, reason: str) -> str:
+    base = message.content if message is not None else ""
+    reply = f"\n\nВаш ответ: {SURVEY_REASONS[reason]}. Спасибо!"
+    if reason == "connect":
+        reply += (" Если захотите разобраться, напишите в /support на сервере: "
+                  "администратор поможет подключиться.")
+    return (base + reply)[:2000]
+
+
+class SurveyOtherModal(discord.ui.Modal, title="Почему не продолжили?"):
+    comment = discord.ui.TextInput(label="Пара слов", style=discord.TextStyle.paragraph,
+                                   max_length=500, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _save_survey(interaction, "other", self.comment.value.strip())
+        await interaction.response.edit_message(
+            content=_survey_answered_text(interaction.message, "other"), view=None)
+
+
+class SurveyView(discord.ui.View):
+    """Кнопки опроса. Постоянные (timeout=None, custom_id) - работают и через
+    несколько дней, и после перезапуска бота."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        for key, label in SURVEY_REASONS.items():
+            button = discord.ui.Button(label=label, custom_id=f"nexus:survey:{key}",
+                                       style=discord.ButtonStyle.secondary)
+            button.callback = self._make_callback(key)
+            self.add_item(button)
+
+    @staticmethod
+    def _make_callback(key: str):
+        async def callback(interaction: discord.Interaction):
+            if key == "other":
+                await interaction.response.send_modal(SurveyOtherModal())
+                return
+            await _save_survey(interaction, key)
+            await interaction.response.edit_message(
+                content=_survey_answered_text(interaction.message, key), view=None)
+        return callback
 
 
 # ---------- поддержка ----------
@@ -1664,7 +1780,7 @@ async def on_member_remove(member: discord.Member):
         if not sub:
             return
         try:
-            await _delete_sub(sub)
+            await _delete_sub(sub, reason="left")
             await send_dm(member, "Вы покинули сервер, поэтому доступ к VPN отозван.")
         except XUIError as e:
             await notify_admin(f"⚠️ {member} ({member.id}) вышел с сервера, но удалить VPN не удалось: {e}",
@@ -1772,7 +1888,7 @@ async def reconcile() -> Counter:
                 if db.get_subscription(sub["discord_id"]) is None:
                     continue
                 try:
-                    await _delete_sub(sub)
+                    await _delete_sub(sub, reason="left")
                     stats["revoked"] += 1
                 except Exception as e:
                     stats["errors"] += 1
@@ -1851,7 +1967,7 @@ async def check_expired():
                 continue
 
             try:
-                await _delete_sub(sub)
+                await _delete_sub(sub, reason="trial_expired")
             except XUIError as e:
                 await notify_admin(f"⚠️ Не удалось удалить истёкшую подписку {discord_id}: {e}",
                                    key=f"expire:{discord_id}")
@@ -1873,7 +1989,15 @@ async def check_expired():
             except discord.HTTPException:
                 target = None
         if target is not None:
-            await send_dm(target, "Срок вашей VPN-подписки истёк, доступ отключён." + _boosty_hint())
+            try:
+                await target.send(
+                    "Пробный период NEXUS VPN закончился, доступ отключён." + _boosty_hint() +
+                    "\n\nПочему вы не стали продолжать? Нажмите вариант, это займёт секунду "
+                    "и поможет нам сделать VPN лучше.",
+                    view=SurveyView(),
+                )
+            except discord.HTTPException:
+                log.info("Не удалось написать в ЛС пользователю %s", discord_id)
 
 
 @check_expired.error
@@ -1926,6 +2050,7 @@ async def _setup():
             log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
 
     client.add_view(TicketCloseView())  # кнопки «Закрыть обращение» после перезапуска
+    client.add_view(SurveyView())       # кнопки опроса после пробного периода
 
     if NEXUS_LINK_BASE:
         global link_server
