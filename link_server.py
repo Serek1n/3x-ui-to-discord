@@ -6,9 +6,9 @@ https://<домен>:<порт>/add/<subId>, а эта страница сраз
 ссылкой nexus://import?url=<подписка>. Если Nexus не открылся - на странице
 есть повторная кнопка, ссылка на скачивание и копирование подписки.
 
-Страница отдаётся только для действующих подписок из базы бота (subId
-известен, подписка не отключена и срок не вышел), поэтому переходник
-нельзя использовать, чтобы подсунуть чужую ссылку.
+Страница отдаётся только для подписок из базы бота (subId известен),
+поэтому переходник нельзя использовать, чтобы подсунуть чужую ссылку. Частота
+запросов с одного IP ограничена, чтобы subId нельзя было подобрать перебором.
 
 Без сертификата ссылка подписки шла бы по сети открытым текстом, поэтому
 без NEXUS_LINK_CERT/NEXUS_LINK_KEY сервер слушает только 127.0.0.1 (вариант
@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import ssl
+import time
 from urllib.parse import quote
 
 from aiohttp import web
@@ -32,6 +33,13 @@ from aiohttp import web
 log = logging.getLogger("link_server")
 
 SUB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+
+# Ограничение частоты: с одного IP не больше RATE_REQUESTS открытий страницы в
+# минуту и не больше RATE_MISSES неверных subId за 10 минут - так subId нельзя
+# подбирать перебором.
+RATE_REQUESTS = 30
+RATE_MISSES = 10
+MISS_WINDOW = 600
 
 
 def nexus_deeplink(sub_url: str) -> str:
@@ -217,6 +225,17 @@ class LinkServer:
         self._runner = None
         self._ssl = None
         self._reload_task = None
+        self._hits: dict = {}     # ip -> [время запросов за минуту]
+        self._misses: dict = {}   # ip -> [время неверных subId за MISS_WINDOW]
+
+    def _limited(self, ip: str, now: float) -> bool:
+        hits = [t for t in self._hits.get(ip, ()) if now - t < 60]
+        misses = [t for t in self._misses.get(ip, ()) if now - t < MISS_WINDOW]
+        self._hits[ip], self._misses[ip] = hits, misses
+        if len(self._hits) > 10000:   # не даём словарю расти бесконечно
+            self._hits.clear()
+            self._misses.clear()
+        return len(hits) >= RATE_REQUESTS or len(misses) >= RATE_MISSES
 
     def _logo(self) -> str:
         return '<img src="/logo.png" alt="">' if self.logo_path else "N"
@@ -241,9 +260,16 @@ class LinkServer:
         return web.FileResponse(self.logo_path, headers={"Cache-Control": "public, max-age=86400"})
 
     async def handle_add(self, request: web.Request) -> web.Response:
+        ip = request.remote or "?"
+        now = time.time()
+        if self._limited(ip, now):
+            return web.Response(text="Слишком много запросов, попробуйте через несколько минут.",
+                                status=429, headers={**HEADERS, "Retry-After": "600"})
+        self._hits.setdefault(ip, []).append(now)
         sub_id = request.match_info.get("sub_id", "")
         sub_url = self.sub_url_for(sub_id) if SUB_ID_RE.match(sub_id) else None
         if not sub_url:
+            self._misses.setdefault(ip, []).append(now)
             return web.Response(text=NOT_FOUND.format(css=CSS, logo=self._logo()), status=404,
                                 content_type="text/html", headers=HEADERS)
         return web.Response(text=self._render(sub_url), content_type="text/html", headers=HEADERS)

@@ -2,6 +2,10 @@
 Description=NEXUS VPN Discord bot (3x-ui)
 After=network-online.target
 Wants=network-online.target
+# Не перезапускать бесконечно: 5 падений за 10 минут - пауза до ручной проверки
+# (или до следующего deploy.sh).
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,9 +14,20 @@ WorkingDirectory=__APP_DIR__
 # .env читает сам бот (python-dotenv) - так комментарии и кавычки в .env
 # обрабатываются правильно.
 ExecStart=__APP_DIR__/.venv/bin/python -u __APP_DIR__/bot.py
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=10
 TimeoutStopSec=20
+# Новые файлы (база, лог, копии) доступны только владельцу.
+UMask=0077
+# Ограничения: процесс не может повысить свои права, системные папки - только
+# для чтения, у бота свой /tmp. ProtectHome не включён: сертификат панели
+# часто лежит в /root/cert.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
 # Подробный лог бот пишет сам в bot.log с ротацией; сюда (journalctl)
 # попадают только запуск/остановка и аварийные ошибки.
 StandardOutput=journal

@@ -126,6 +126,11 @@ def init_db():
             conn.execute("UPDATE subscriptions SET kind = 'trial' WHERE expiry_ms > 0")
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN reminders INTEGER NOT NULL DEFAULT 0")
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        # Отложенное удаление: момент, после которого клиент удаляется, если
+        # роль не вернулась (0 - удаление не запланировано).
+        _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN revoke_at INTEGER NOT NULL DEFAULT 0")
+        _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS subscriptions_sub_id ON subscriptions (sub_id)")
         _backfill_events(conn)
 
 
@@ -213,6 +218,29 @@ def list_by_kind(kind=None):
             rows = conn.execute("SELECT * FROM subscriptions WHERE kind = ?", (kind,)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM subscriptions").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_revoke(discord_id, revoke_at, reason):
+    with get_conn() as conn:
+        conn.execute("UPDATE subscriptions SET revoke_at = ?, revoke_reason = ? WHERE discord_id = ?",
+                     (int(revoke_at), reason, discord_id))
+
+
+def clear_revoke(discord_id):
+    with get_conn() as conn:
+        conn.execute("UPDATE subscriptions SET revoke_at = 0, revoke_reason = '' WHERE discord_id = ?",
+                     (discord_id,))
+
+
+def list_pending_revokes(due_before=None):
+    """Подписки, ожидающие удаления; due_before - только те, чей срок уже наступил."""
+    with get_conn() as conn:
+        if due_before is None:
+            rows = conn.execute("SELECT * FROM subscriptions WHERE revoke_at > 0").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM subscriptions WHERE revoke_at > 0 AND revoke_at <= ?",
+                                (int(due_before),)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -359,3 +387,16 @@ def survey_comments(limit=5):
         rows = conn.execute("SELECT comment FROM survey WHERE comment != '' ORDER BY ts DESC LIMIT ?",
                             (limit,)).fetchall()
         return [r["comment"] for r in rows]
+
+
+def backup_to(path):
+    """Согласованная копия базы (работает и пока бот пишет в неё)."""
+    src = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        dst = sqlite3.connect(path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()

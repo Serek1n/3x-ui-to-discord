@@ -23,6 +23,7 @@ CACHE_SEC = 300
 NODES_CACHE_SEC = 24 * 3600
 MAX_NODES = 5
 
+MIN_NODES_FOR_BLOCKED = 3
 _nodes_cache: tuple[float, list] = (0.0, [])
 _result_cache: dict = {}
 
@@ -42,7 +43,9 @@ class RFResult:
         if self.ok == self.total:
             return "ok"
         if self.ok == 0:
-            return "blocked"
+            # Один-два ответивших узла - слишком мало, чтобы утверждать о
+            # блокировке: у самих узлов check-host бывают сбои.
+            return "blocked" if self.total >= MIN_NODES_FOR_BLOCKED else "unknown"
         return "partial"
 
     @property

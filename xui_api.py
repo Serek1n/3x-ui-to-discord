@@ -11,6 +11,7 @@ find_client, get_client_traffic, close) + дополнительные мето�
 доступны только через API (IP клиента, внешние подписки, статус сервера).
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -54,6 +55,8 @@ class XUIApi:
         self.login_debug_info = "API-токен"
         self._inbound_ids_setting = (inbound_ids or "all").strip().lower()
         self._inbound_ids_cache: list | None = None
+        self._inbounds_ts = 0.0
+        self._inbounds_raw: list = []
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -81,11 +84,38 @@ class XUIApi:
 
     # ---------- низкий уровень ----------
 
+    RETRIES = 3
+    RETRY_STATUSES_GET = (429, 500, 502, 503, 504)
+    # Для изменяющих запросов повторяем только то, что точно не выполнилось.
+    RETRY_STATUSES_POST = (429, 503)
+
+    async def _send(self, method: str, path: str, body=None):
+        """Запрос с повторами при временных сбоях. GET повторяется при любой
+        сетевой ошибке и 429/5xx; POST - только если соединение не установилось
+        или панель ответила 429/503 (запрос не обработан)."""
+        is_get = method.upper() == "GET"
+        last = None
+        for attempt in range(self.RETRIES):
+            if attempt:
+                await asyncio.sleep(0.5 * 3 ** (attempt - 1))
+            try:
+                r = await self._http.request(method, path, json=body)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                last = XUIError(f"[{self.name}] нет связи с панелью ({path}): {e}")
+                continue
+            except httpx.HTTPError as e:
+                last = XUIError(f"[{self.name}] нет связи с панелью ({path}): {e}")
+                if is_get:
+                    continue
+                raise last
+            if r.status_code in (self.RETRY_STATUSES_GET if is_get else self.RETRY_STATUSES_POST):
+                last = XUIError(f"[{self.name}] панель временно недоступна (HTTP {r.status_code}) на {path}")
+                continue
+            return r
+        raise last
+
     async def _req(self, method: str, path: str, body=None, *, allow_fail: bool = False):
-        try:
-            r = await self._http.request(method, path, json=body)
-        except httpx.HTTPError as e:
-            raise XUIError(f"[{self.name}] нет связи с панелью ({path}): {e}")
+        r = await self._send(method, path, body)
         if r.status_code in (401, 403):
             raise XUIError(f"[{self.name}] панель отклонила токен ({r.status_code}) на {path} - "
                            f"проверьте API-токен (scope admin) и XUI_WEB_BASE_PATH")
@@ -95,7 +125,7 @@ class XUIApi:
         try:
             data = r.json()
         except ValueError:
-            raise XUIError(f"[{self.name}] не-JSON ответ на {path} (HTTP {r.status_code}): {r.text[:200]}")
+            raise XUIError(f"[{self.name}] не-JSON ответ на {path} (HTTP {r.status_code})")
         if not isinstance(data, dict):
             raise XUIError(f"[{self.name}] неожиданный ответ на {path}: {str(data)[:200]}")
         if not data.get("success") and not allow_fail:
@@ -105,10 +135,13 @@ class XUIApi:
     # ---------- inbound'ы ----------
 
     async def inbound_ids(self) -> list:
-        if self._inbound_ids_cache is not None:
+        # Список запоминается на 10 минут: добавленный или удалённый в панели
+        # inbound подхватывается без перезапуска бота.
+        if self._inbound_ids_cache is not None and time.time() - self._inbounds_ts < self.INBOUNDS_TTL:
             return self._inbound_ids_cache
         data = await self._req("GET", "/panel/api/inbounds/list")
         inbounds = data.get("obj") or []
+        self._inbounds_raw = [ib for ib in inbounds if isinstance(ib, dict)]
         all_ids = [ib.get("id") for ib in inbounds if isinstance(ib, dict) and ib.get("id") is not None]
         enabled = [ib.get("id") for ib in inbounds
                    if isinstance(ib, dict) and ib.get("id") is not None and ib.get("enable", True)]
@@ -123,24 +156,55 @@ class XUIApi:
         if not ids:
             raise XUIError(f"[{self.name}] в панели нет подходящих inbound'ов")
         self._inbound_ids_cache = ids
+        self._inbounds_ts = time.time()
         return ids
+
+    INBOUNDS_TTL = 600
+    TCP_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
+
+    async def tcp_port(self) -> int | None:
+        """Порт первого включённого inbound'а на TCP-протоколе из тех, куда бот
+        добавляет клиентов. Нужен для проверки доступности из РФ: проверять
+        надо порт VPN, а не порт подписок."""
+        try:
+            ids = await self.inbound_ids()
+        except XUIError:
+            return None
+        for ib in self._inbounds_raw:
+            if ib.get("id") in ids and ib.get("enable", True) \
+                    and str(ib.get("protocol", "")).lower() in self.TCP_PROTOCOLS and ib.get("port"):
+                return int(ib["port"])
+        return None
 
     # ---------- клиенты ----------
 
     async def find_client(self, email: str):
-        """Объект трафика клиента (subId, uuid, expiryTime, up, down...) или None."""
-        data = await self._req("GET", f"/panel/api/clients/traffic/{_q(email)}", allow_fail=True)
+        """Объект трафика клиента (subId, uuid, expiryTime, up, down...) или
+        None, если клиента нет. Ошибка панели - это XUIError, а не «нет»:
+        панель отвечает success:false при сбое и success:true с пустым obj,
+        когда клиента действительно нет."""
+        data = await self._req("GET", f"/panel/api/clients/traffic/{_q(email)}")
         obj = data.get("obj")
-        if data.get("success") and isinstance(obj, dict) and obj.get("email") == email:
+        if obj is None:
+            return None
+        if isinstance(obj, dict) and obj.get("email") == email:
             return obj
-        return None
+        raise XUIError(f"[{self.name}] неожиданный ответ на запрос клиента {email}")
 
     async def get_client_traffic(self, email: str):
+        """Как find_client, но без исключений: None и при отсутствии, и при
+        ошибке. Только для показа (трафик в /myvpn), не для решений об удалении."""
         try:
             return await self.find_client(email)
         except XUIError as e:
             log.warning("%s", e)
             return None
+
+    async def list_emails(self) -> set:
+        """Email всех клиентов панели - для поиска клиентов, о которых бот не знает."""
+        data = await self._req("GET", "/panel/api/clients/list")
+        return {str(row.get("email")) for row in data.get("obj") or []
+                if isinstance(row, dict) and row.get("email")}
 
     async def add_client(self, inbound_id: int, email: str, days: int, total_gb: int = 0,
                           ip_limit: int = 0, auto_renew_days: int = 0, *,
@@ -166,8 +230,12 @@ class XUIApi:
             "comment": comment,
             "reset": int(auto_renew_days or 0),
         }
-        await self._req("POST", "/panel/api/clients/add",
-                        {"client": client, "inboundIds": await self.inbound_ids()})
+        try:
+            await self._req("POST", "/panel/api/clients/add",
+                            {"client": client, "inboundIds": await self.inbound_ids()})
+        except XUIError:
+            self._inbound_ids_cache = None   # вдруг inbound удалили - перечитать при повторе
+            raise
 
         found = await self.find_client(email)
         if not found:
@@ -207,7 +275,9 @@ class XUIApi:
         return []
 
     async def get_external_links(self, email: str, sub_id: str) -> list:
-        data = await self._req("GET", f"/panel/api/clients/get/subId/{_q(sub_id)}", allow_fail=True)
+        # Без allow_fail: при сбое чтения нельзя вернуть «ссылок нет» - иначе
+        # следующая запись сотрёт ссылки, добавленные админом вручную.
+        data = await self._req("GET", f"/panel/api/clients/get/subId/{_q(sub_id)}")
         for item in data.get("obj") or []:
             if not isinstance(item, dict):
                 continue

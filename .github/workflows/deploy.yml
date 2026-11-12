@@ -1,25 +1,31 @@
 # Автообновление бота на VPS после каждого Push в main.
 # Нужные секреты репозитория (Settings → Secrets and variables → Actions):
-#   VPS_HOST     - IP или домен сервера
-#   VPS_USER     - пользователь SSH (обычно root)
-#   VPS_SSH_KEY  - приватный SSH-ключ (весь текст файла)
-#   VPS_PORT     - порт SSH (необязательно, по умолчанию 22)
-#   VPS_APP_DIR  - папка бота (необязательно, по умолчанию /opt/3x-ui-to-discord)
+#   VPS_HOST        - IP или домен сервера
+#   VPS_USER        - пользователь SSH (обычно root)
+#   VPS_SSH_KEY     - приватный SSH-ключ (весь текст файла)
+#   VPS_FINGERPRINT - отпечаток SSH-ключа сервера (защита от подмены сервера), см. README
+#   VPS_PORT        - порт SSH (необязательно, по умолчанию 22)
+#   VPS_APP_DIR     - папка бота (необязательно, по умолчанию /opt/3x-ui-to-discord)
+# Пока секреты не заданы, выкладка пропускается (проверки и тесты всё равно идут).
 name: Deploy to VPS
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: deploy
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -27,17 +33,40 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Проверка кода перед выкладкой
+      - name: Зависимости (сам браузер не скачивается - тестам он не нужен)
+        run: pip install -q -r requirements.txt pyflakes
+
+      - name: Проверка кода
         run: |
           python -m py_compile *.py
+          python -m pyflakes *.py tests/*.py
           bash -n deploy.sh backup.sh install_ubuntu.sh
 
+      - name: Тесты
+        run: python tests/run_all.py
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HAS_SECRETS: ${{ secrets.VPS_HOST != '' && secrets.VPS_SSH_KEY != '' }}
+    steps:
+      - name: Секреты не заданы - выкладка пропущена
+        if: env.HAS_SECRETS != 'true'
+        run: echo "::notice::VPS_HOST / VPS_SSH_KEY не заданы, обновите сервер вручную (deploy.sh)."
+
       - name: Обновление на VPS
-        uses: appleboy/ssh-action@v1.2.0
+        if: env.HAS_SECRETS == 'true'
+        # Действие закреплено по коммиту (тег v1.2.0), чтобы подмена тега не
+        # дала чужому коду доступ к SSH-ключу.
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_FINGERPRINT }}
           port: ${{ secrets.VPS_PORT || 22 }}
           command_timeout: 10m
           script: bash "${{ secrets.VPS_APP_DIR || '/opt/3x-ui-to-discord' }}/deploy.sh"

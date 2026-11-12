@@ -56,9 +56,30 @@ install_deps() {
   "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 }
 
+# Строки лога без адресов: в них может быть секретный путь панели или subId.
+show_log() {
+  tail -n 30 "$APP_DIR/bot.log" 2>/dev/null | sed -E 's#https?://[^ )"]+#<адрес скрыт>#g' || true
+  journalctl -u "$SERVICE" -n 20 --no-pager 2>/dev/null \
+    | sed -E 's#https?://[^ )"]+#<адрес скрыт>#g' || true
+}
+
+rollback_code() {
+  echo "==> Откат на ${OLD:0:7}"
+  git reset --hard "$OLD"
+  if ! git diff --quiet "$NEW" "$OLD" -- requirements.txt; then
+    install_deps || echo "!! Не удалось восстановить зависимости прошлой версии"
+  fi
+}
+
 if [ "$FORCE" -eq 1 ] || ! git diff --quiet "$OLD" "$NEW" -- requirements.txt; then
   echo "==> Устанавливаю зависимости"
-  install_deps
+  if ! install_deps; then
+    echo "!! Зависимости не установились. Бот не перезапускался."
+    if [ "$OLD" != "$NEW" ]; then
+      rollback_code
+    fi
+    exit 1
+  fi
 fi
 
 # Пользователь сервиса: как в текущем unit, иначе root.
@@ -85,6 +106,7 @@ install_unit
 
 restart_and_wait() {
   rm -f "$READY"
+  systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE"
   echo "==> Жду запуска бота (до 90 секунд)..."
   for _ in $(seq 1 30); do
@@ -102,19 +124,14 @@ if restart_and_wait; then
 fi
 
 echo "!! Бот не запустился на новой версии. Последние строки лога:"
-tail -n 30 "$APP_DIR/bot.log" 2>/dev/null || true
-journalctl -u "$SERVICE" -n 20 --no-pager 2>/dev/null || true
+show_log
 
 if [ "$OLD" = "$NEW" ]; then
   echo "!! Откатываться некуда (версия не менялась). Проверьте .env и лог выше."
   exit 1
 fi
 
-echo "==> Откат на ${OLD:0:7}"
-git reset --hard "$OLD"
-if ! git diff --quiet "$NEW" "$OLD" -- requirements.txt; then
-  install_deps
-fi
+rollback_code
 install_unit
 if restart_and_wait; then
   echo "==> Откат выполнен, бот работает на прошлой версии ${OLD:0:7}"

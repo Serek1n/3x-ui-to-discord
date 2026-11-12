@@ -237,7 +237,7 @@ class XUIClient:
                 f"{self.base_url}/", timeout=self.timeout_ms, wait_until="load",
             )
         except Exception as e:
-            raise XUIError(f"Не удалось открыть панель ({self.base_url}/): {e}")
+            raise XUIError(f"Не удалось открыть панель: {type(e).__name__}")
 
         nav_status = response.status if response else None
         nav_headers = dict(response.headers) if response else {}
@@ -271,11 +271,12 @@ class XUIClient:
                 screenshot_note = f"Скриншот сохранён: {screenshot_path}"
             except Exception:
                 screenshot_note = "Не удалось сохранить скриншот"
+            # Подробности (заголовки, HTML) - только в журнал на уровне DEBUG:
+            # текст ошибки уходит в канал админов и может содержать cookie.
+            log.debug("Форма входа: статус %s, заголовки %s, HTML %r", nav_status, nav_headers, html[:600])
             raise XUIError(
-                f"Не нашёл поле пароля на странице {self.base_url}/: {e}. "
-                f"Код ответа навигации: {nav_status}. Заголовки ответа: {nav_headers}. "
-                f"Заголовок страницы: {title!r}. Длина HTML: {len(html)} символов. "
-                f"Начало HTML: {html[:600]!r}. {screenshot_note}"
+                f"Не нашёл поле пароля на странице входа: {type(e).__name__}. "
+                f"Код ответа: {nav_status}. Заголовок страницы: {title!r}. {screenshot_note}"
             )
 
         try:
@@ -284,11 +285,7 @@ class XUIClient:
             username_input = self._page.locator('input:not([type="password"])').first
             await username_input.fill(self.username, timeout=self.timeout_ms)
         except Exception as e:
-            html_snippet = (await self._page.content())[:400]
-            raise XUIError(
-                f"Нашёл поле пароля, но не смог заполнить форму логина: {e}. "
-                f"HTML: {html_snippet}"
-            )
+            raise XUIError(f"Нашёл поле пароля, но не смог заполнить форму логина: {type(e).__name__}")
 
         login_response_json = None
         try:
@@ -321,11 +318,8 @@ class XUIClient:
 
         current_url = self._page.url
         if "/login" in current_url:
-            html_snippet = (await self._page.content())[:400]
-            raise XUIError(
-                f"После отправки формы логина всё ещё на странице входа ({current_url}). "
-                f"Скорее всего неверный логин или пароль. Фрагмент страницы: {html_snippet}"
-            )
+            raise XUIError("После отправки формы логина всё ещё на странице входа. "
+                           "Скорее всего неверный логин или пароль.")
 
         # Ищем токен в ответе на логин (частый паттерн: токен возвращается в теле
         # POST /login, а не кладётся в cookie) и в localStorage/sessionStorage -
@@ -388,7 +382,7 @@ class XUIClient:
                 pass  # не важно, успешен ли сам запрос - важно, поймал ли листенер токен
 
         self.login_debug_info = (
-            f"успешно, итоговый URL: {current_url}, "
+            "успешно, "
             f"токен для API найден: {'да' if self._csrf_token else 'нет'}"
         )
 
@@ -456,17 +450,16 @@ class XUIClient:
             raise XUIError(f"Ошибка выполнения запроса к {path} внутри браузера: {e}")
 
         if result["status"] in (401, 403):
+            log.debug("%s -> %s, заголовки %s", path, result["status"], result.get("headers"))
             raise XUIError(
-                f"{path} вернул {result['status']}: {result['text'][:200]!r}. "
-                f"CSRF-токен найден и отправлен: {bool(result.get('tokenUsed'))}. "
-                f"Заголовки ответа: {result.get('headers')}. "
-                f"Текущие cookie страницы: {result.get('cookies')!r}"
+                f"Запрос к API вернул {result['status']} (нет доступа). "
+                f"CSRF-токен отправлен: {bool(result.get('tokenUsed'))}."
             )
 
         try:
             return json.loads(result["text"])
         except ValueError:
-            raise XUIError(f"3x-ui вернул не-JSON ответ на {path}: {result['text'][:300]}")
+            raise XUIError(f"3x-ui вернул не-JSON ответ (код {result['status']}, {len(result['text'])} символов)")
 
     async def _try_path_bodies(self, method, path_bodies):
         """path_bodies: список (path, body) - у каждого пути своё тело,
@@ -650,11 +643,8 @@ class XUIClient:
         try:
             await modal.wait_for(state="hidden", timeout=self.timeout_ms)
         except Exception:
-            html = (await self._page.content())[:400]
-            raise XUIError(
-                f"Окно создания клиента не закрылось - вероятно, панель показала "
-                f"ошибку валидации формы. Фрагмент страницы: {html}"
-            )
+            raise XUIError("Окно создания клиента не закрылось - вероятно, панель показала "
+                           "ошибку валидации формы.")
 
     async def _find_client_by_email(self, email: str):
         # В 3x-ui v3 клиенты могут лежать и в списке inbound'ов, и в отдельном
@@ -755,8 +745,7 @@ class XUIClient:
             delete_icon = row.locator("button").nth(4)
             await delete_icon.click(timeout=self.timeout_ms)
         except Exception as e:
-            html_snippet = (await row.inner_html())[:300]
-            raise XUIError(f"Не нашёл/не смог нажать иконку удаления в строке клиента: {e}. Строка: {html_snippet}")
+            raise XUIError(f"Не нашёл/не смог нажать иконку удаления в строке клиента: {type(e).__name__}")
 
         try:
             confirm_btn = self._page.locator(self.DELETE_CONFIRM_BUTTON_SELECTOR)

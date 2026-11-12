@@ -41,7 +41,8 @@ import logging
 import os
 import re
 import time
-from collections import Counter
+import math
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -115,6 +116,35 @@ VPN_ROLE_NAME = _env("VPN_ROLE_NAME", "VPN Access")
 VPN_GIFT_ROLES = {r.strip() for r in _env("VPN_GIFT_ROLES", "").split(",") if r.strip()}
 # Любая из этих ролей = платный (бессрочный) доступ.
 PAID_ROLES = {VPN_ROLE_NAME} | VPN_GIFT_ROLES
+
+
+def _env_ids(name: str) -> set:
+    return {int(x) for x in re.split(r"[\s,;]+", _env(name)) if x.isdigit()}
+
+
+# ID своего сервера Discord. Роли и админ-команды признаются ТОЛЬКО на нём:
+# без этого владелец любого сервера, куда добавили бота, мог бы создать у себя
+# роль с таким же названием и получить VPN или права администратора.
+# Если не задан, берётся TEST_GUILD_ID; если и его нет - единственный сервер бота.
+GUILD_ID = next(iter(_env_ids("GUILD_ID") or _env_ids("TEST_GUILD_ID")), 0)
+# ID ролей (необязательно, но надёжнее названий: роль можно переименовать, и
+# нельзя подделать, создав одноимённую). Если ID задан, название не учитывается.
+VPN_ROLE_IDS = _env_ids("VPN_ROLE_ID")
+VPN_GIFT_ROLE_IDS = _env_ids("VPN_GIFT_ROLE_IDS")
+TRIAL_ROLE_IDS = _env_ids("TRIAL_ROLE_ID")
+ADMIN_ROLE_IDS = _env_ids("ADMIN_ROLE_ID")
+# Отсрочка удаления после снятия роли или выхода с сервера, минут. Если роль
+# за это время вернулась (Boosty иногда снимает и возвращает роли), клиент и
+# ссылка остаются прежними. 0 - удалять сразу.
+REVOKE_GRACE_MINUTES = _env_int("REVOKE_GRACE_MINUTES", "15")
+# Сколько подписок бот может отозвать за час без подтверждения админа.
+# 0 - авто: 20% от числа подписок, но не меньше 2.
+REVOKE_LIMIT_PER_HOUR = _env_int("REVOKE_LIMIT_PER_HOUR", "0")
+# Не выдавать пробный период аккаунтам Discord моложе N дней (0 - не проверять).
+TRIAL_MIN_ACCOUNT_AGE_DAYS = _env_int("TRIAL_MIN_ACCOUNT_AGE_DAYS", "0")
+# Вебхук закрытого канала, куда раз в сутки отправляется копия базы (пусто - выключено).
+# В базе есть ссылки подписок - канал должен быть доступен только вам.
+DB_BACKUP_WEBHOOK_URL = _env("DB_BACKUP_WEBHOOK_URL", "")
 # Роль разового пробного доступа.
 TRIAL_ROLE_NAME = _env("TRIAL_ROLE_NAME", "VPN Trial")
 
@@ -183,6 +213,7 @@ class Panel:
     name: str
     sub_base: str
     check_target: str = ""
+    check_explicit: bool = False   # адрес проверки задан в .env (иначе - порт VPN из панели)
     api: XUIApi | None = None
     env: dict = field(default_factory=dict)
 
@@ -203,6 +234,7 @@ def _host_port(url: str) -> str:
 primary = Panel(
     name=XUI_NAME, sub_base=XUI_SUB_BASE,
     check_target=_env("XUI_CHECK_TARGET", "") or _host_port(XUI_SUB_BASE),
+    check_explicit=bool(_env("XUI_CHECK_TARGET", "")),
 )
 
 # Дополнительные серверы: XUI2_*, XUI3_*, ... (только через API-токен).
@@ -216,6 +248,7 @@ for _n in range(2, 6):
         name=_env(f"XUI{_n}_NAME", f"Сервер {_n}"),
         sub_base=_sub,
         check_target=_env(f"XUI{_n}_CHECK_TARGET") or _host_port(_sub),
+        check_explicit=bool(_env(f"XUI{_n}_CHECK_TARGET")),
         env={
             "base_url": _base,
             "token": os.environ.get(f"XUI{_n}_API_TOKEN", "").strip(),
@@ -234,6 +267,13 @@ def api_mode() -> bool:
 def active_extras() -> list:
     """Подключённые дополнительные серверы (нужен API на основном)."""
     return [p for p in extra_panels if p.api is not None] if api_mode() else []
+
+
+def configured_extras() -> list:
+    """Доп. серверы из настроек, подключены они сейчас или нет. Удаление и
+    сверка идут по этому списку: сервер, недоступный в момент запуска бота,
+    не должен выпадать из учёта."""
+    return [p for p in extra_panels if p.env.get("token") and p.env.get("sub_base_ok")]
 
 
 link_server: LinkServer | None = None
@@ -305,34 +345,89 @@ def make_qr_file(link: str, filename: str = "subscription_qr.png") -> discord.Fi
     return discord.File(buf, filename=filename)
 
 
-def _role_names(member) -> set:
-    return {r.name for r in getattr(member, "roles", [])}
+PAID_KINDS = {"boosty", "gift"}
+WATCHED_KINDS = PAID_KINDS | {"trial"}
+_ROLE_RULES = (
+    ("admin", ADMIN_ROLE_IDS, {ADMIN_ROLE_NAME}),
+    ("boosty", VPN_ROLE_IDS, {VPN_ROLE_NAME}),
+    ("gift", VPN_GIFT_ROLE_IDS, VPN_GIFT_ROLES),
+    ("trial", TRIAL_ROLE_IDS, {TRIAL_ROLE_NAME}),
+)
+
+
+def role_kinds(role) -> set:
+    """Что означает роль для бота: 'admin', 'boosty', 'gift', 'trial'.
+    Если для вида роли задан ID, сверяется ID, иначе название."""
+    out = set()
+    for kind, ids, names in _ROLE_RULES:
+        if (getattr(role, "id", None) in ids) if ids else (role.name in names):
+            out.add(kind)
+    return out
+
+
+def home_guild_id() -> int | None:
+    """ID сервера, на котором действуют роли. None - определить нельзя
+    (GUILD_ID не задан, а бот состоит в нескольких серверах): в этом случае
+    роли не признаются нигде."""
+    if GUILD_ID:
+        return GUILD_ID
+    guilds = client.guilds
+    return guilds[0].id if len(guilds) == 1 else None
+
+
+def home_guild():
+    gid = home_guild_id()
+    for g in client.guilds:
+        if g.id == gid:
+            return g
+    return None
+
+
+def _is_home(guild) -> bool:
+    gid = home_guild_id()
+    return guild is not None and gid is not None and getattr(guild, "id", None) == gid
+
+
+def _guild_ready() -> bool:
+    g = home_guild()
+    return g is not None and not getattr(g, "unavailable", False)
+
+
+def access(member) -> set:
+    """Виды ролей участника. Роли чужих серверов не считаются."""
+    guild = getattr(member, "guild", None)
+    if guild is not None and not _is_home(guild):
+        return set()
+    out = set()
+    for r in getattr(member, "roles", []):
+        out |= role_kinds(r)
+    return out
+
+
+def role_title(member, kind: str) -> str:
+    """Название роли участника данного вида - для текста сообщений."""
+    for r in getattr(member, "roles", []):
+        if kind in role_kinds(r):
+            return r.name
+    return VPN_ROLE_NAME
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
-    if interaction.guild is None:
+    if not _is_home(interaction.guild):
         return False
-    return ADMIN_ROLE_NAME in _role_names(interaction.user)
+    return "admin" in access(interaction.user)
 
 
 def can_view_status(interaction: discord.Interaction) -> bool:
-    if interaction.guild is None:
+    if not _is_home(interaction.guild):
         return False
-    return bool(_role_names(interaction.user) & {ADMIN_ROLE_NAME, TRIAL_ROLE_NAME} | PAID_ROLES)
+    return bool(access(interaction.user) & (WATCHED_KINDS | {"admin"}))
 
 
 def find_member(user_id: int):
-    """Ищет участника на серверах бота (нужно, когда команда пришла из ЛС).
-    Предпочитает тот сервер, где у человека есть VPN-роль."""
-    fallback = None
-    for g in client.guilds:
-        m = g.get_member(user_id)
-        if m is None:
-            continue
-        if _role_names(m) & PAID_ROLES | {TRIAL_ROLE_NAME}:
-            return m
-        fallback = fallback or m
-    return fallback
+    """Участник своего сервера (нужно, когда команда пришла из ЛС)."""
+    g = home_guild()
+    return g.get_member(user_id) if g is not None else None
 
 
 async def send_dm(user, text: str, link: str | None = None):
@@ -367,7 +462,8 @@ async def notify_admin(text: str, key: str | None = None, cooldown: int = 6 * 36
         _last_alerts[key] = now
     try:
         webhook = discord.Webhook.from_url(ADMIN_LOG_WEBHOOK_URL, client=client)
-        await webhook.send(text[:1900], username="NEXUS_VPN Logs")
+        await webhook.send(text[:1900], username="NEXUS_VPN Logs",
+                           allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         log.error("Не удалось отправить оповещение админам: %s", e)
 
@@ -390,55 +486,98 @@ def _email(discord_id: str) -> str:
     return f"discord_{discord_id}"
 
 
+def _need_panel():
+    """Основная панель подключается в фоне; пока её нет, операции откладываются."""
+    if xui is None:
+        raise XUIError("основная панель 3x-ui сейчас недоступна, бот повторит попытку")
+
+
+def _all_apis() -> list:
+    return ([xui] if xui is not None else []) + [p.api for p in active_extras()]
+
+
 async def _link_extras(email: str, sub_id: str, extra_subs: dict, preserve: list | None = None):
     """Прописывает подписки доп. серверов как внешние у основного клиента."""
     if not api_mode() or not (extra_subs or preserve):
         return
     await xui.set_external_subscriptions(
-        email, sub_id, extra_subs, [p.sub_base for p in active_extras()], preserve=preserve,
+        email, sub_id, extra_subs, [p.sub_base for p in configured_extras()], preserve=preserve,
     )
 
 
-async def _create_on_extras(email: str, expiry_time: int, comment: str) -> dict:
-    """Создаёт клиента на всех доп. серверах. Возвращает {название: url подписки}.
-    Ошибка на одном сервере не мешает выдаче - сверка доделает позже."""
-    subs = {}
-    for panel in active_extras():
+async def _create_on_extras(email: str, expiry_time: int, comment: str):
+    """Создаёт клиента на всех доп. серверах. Возвращает ({название: url подписки},
+    [серверы, где не получилось]). Ошибка на одном сервере не мешает выдаче:
+    сверка досоздаст клиента позже (см. ensure_extras)."""
+    subs, failed = {}, []
+    for panel in configured_extras():
+        if panel.api is None:
+            failed.append(panel.name)
+            continue
         try:
             created = await panel.api.add_client(
                 0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time, comment=comment,
             )
             subs[panel.name] = f"{panel.sub_base}/{created['subId']}"
         except XUIError as e:
+            failed.append(panel.name)
             await notify_admin(f"⚠️ Не удалось создать клиента {email} на сервере «{panel.name}»: {e}",
                                key=f"extra:{panel.name}:{email}")
-    return subs
+    return subs, failed
 
 
 async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = "") -> str:
     """Создаёт клиента на всех серверах и запись в БД. Возвращает ссылку подписки."""
+    _need_panel()
     email = _email(discord_id)
     comment = f"discord: {member}" if member is not None else ""
+    failed = []
     if api_mode():
         expiry_time = -TRIAL_DAYS * 86_400_000 if kind == "trial" else 0
         created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT,
                                        expiry_time=expiry_time, comment=comment)
-        extra_subs = await _create_on_extras(email, expiry_time, comment)
+        extra_subs, failed = await _create_on_extras(email, expiry_time, comment)
         try:
             await _link_extras(email, created["subId"], extra_subs)
         except XUIError as e:
+            failed.append("внешние ссылки")
             await notify_admin(f"⚠️ Не удалось прописать доп. серверы в подписку {email}: {e}",
                                key=f"links:{email}")
     else:
         days = TRIAL_DAYS if kind == "trial" else 0
         created = await xui.add_client(XUI_INBOUND_ID, email, days, ip_limit=DEVICE_LIMIT)
+        await _verify_browser_client(email, kind)
     db.create_subscription(
         discord_id, email, created["uuid"], created["subId"],
         XUI_INBOUND_ID, created["expiryMs"], kind=kind, source=source or kind,
     )
-    _extras_checked.add(discord_id)
+    # Проверенной подписка считается, только если всё создалось на всех серверах.
+    if failed:
+        _checked.pop(discord_id, None)
+    else:
+        _checked[discord_id] = time.time()
     log.info("Выдана подписка %s пользователю %s", kind, discord_id)
     return sub_link(created["subId"])
+
+
+async def _verify_browser_client(email: str, kind: str):
+    """Режим браузера заполняет форму «на ощупь»: если срок или лимит устройств
+    не применились, клиент всё равно создаётся. Сверяем результат и сообщаем
+    админам о расхождении."""
+    try:
+        found = await xui.find_client(email)
+    except XUIError:
+        return
+    if not isinstance(found, dict):
+        return
+    problems = []
+    if kind == "trial" and not found.get("expiryTime"):
+        problems.append("срок не установлен")
+    if DEVICE_LIMIT and "limitIp" in found and int(found.get("limitIp") or 0) != DEVICE_LIMIT:
+        problems.append(f"лимит устройств {found.get('limitIp')} вместо {DEVICE_LIMIT}")
+    if problems:
+        await notify_admin(f"⚠️ Клиент {email} создан через браузер с отклонениями: "
+                           + ", ".join(problems) + ". Проверьте его в панели.", key=f"browser:{email}")
 
 
 def _sub_source(sub: dict) -> str:
@@ -448,28 +587,64 @@ def _sub_source(sub: dict) -> str:
 
 
 async def _delete_sub(sub: dict, reason: str = ""):
-    """Удаляет клиента со всех серверов (сначала дополнительные: если там
-    ошибка, запись в БД остаётся и удаление повторится при сверке).
+    """Удаляет клиента со ВСЕХ серверов из настроек. Недоступный сервер не
+    мешает удалению на остальных, но запись в БД остаётся, пока клиент не
+    удалён везде, - удаление повторится при следующей сверке.
     reason - причина для статистики (пусто - не считается окончанием,
     например при замене trial на платную)."""
-    for panel in active_extras():
-        await panel.api.delete_client(0, "", email=sub["email"])
-    await xui.delete_client(sub["inbound_id"], sub["client_uuid"], email=sub["email"])
+    _need_panel()
+    errors = []
+    if api_mode():
+        for panel in configured_extras():
+            if panel.api is None:
+                errors.append(f"«{panel.name}» не подключён")
+                continue
+            try:
+                await panel.api.delete_client(0, "", email=sub["email"])
+            except XUIError as e:
+                errors.append(str(e))
+    try:
+        await xui.delete_client(sub["inbound_id"], sub["client_uuid"], email=sub["email"])
+    except XUIError as e:
+        errors.append(str(e))
+    if errors:
+        raise XUIError("удаление не завершено: " + "; ".join(errors))
     db.delete_subscription(sub["discord_id"])
     if reason:
         db.log_event(sub["discord_id"], "end", source=_sub_source(sub), detail=reason)
-    _extras_checked.discard(sub["discord_id"])
-    log.info("Удалена подписка %s пользователя %s", sub.get("kind"), sub["discord_id"])
+    _checked.pop(sub["discord_id"], None)
+    log.info("Удалена подписка %s пользователя %s (%s)", sub.get("kind"), sub["discord_id"], reason or "замена")
+
+
+async def _lookup(api, email: str):
+    """Клиент на панели: объект, None (точно нет) или XUIError (панель не ответила)."""
+    if isinstance(api, XUIApi):
+        return await api.find_client(email)
+    traffic = await api.get_client_traffic(email)   # режим браузера: None и при ошибке
+    if traffic:
+        return traffic
+    return await api.find_client(email)
 
 
 async def _panel_expiry_state(sub: dict):
-    """('started', ms) | ('not_started', None) | ('unknown', None)"""
-    panels = [xui] + [p.api for p in active_extras()]
-    seen_negative = False
-    started = []
-    for client_api in panels:
-        traffic = await client_api.get_client_traffic(sub["email"])
-        exp = traffic.get("expiryTime") if traffic else None
+    """Срок пробной подписки по панелям:
+    ('started', ms)      - срок идёт, ms - самый ранний конец;
+    ('not_started', None) - клиент есть, ещё не подключался;
+    ('absent', None)      - все панели ответили: клиента нет или срок не задан;
+    ('unknown', None)     - хотя бы одна панель не ответила и срок не известен.
+    По 'unknown' ничего удалять и перевыпускать нельзя."""
+    started, seen_negative, errors = [], False, False
+    if xui is None:
+        errors = True
+    if api_mode() and any(p.api is None for p in configured_extras()):
+        errors = True
+    for client_api in _all_apis():
+        try:
+            found = await _lookup(client_api, sub["email"])
+        except XUIError:
+            errors = True
+            continue
+        exp = found.get("expiryTime") if isinstance(found, dict) else None
         if isinstance(exp, (int, float)):
             if exp > 0:
                 started.append(int(exp))
@@ -479,40 +654,96 @@ async def _panel_expiry_state(sub: dict):
         return "started", min(started)
     if seen_negative:
         return "not_started", None
-    return "unknown", None
+    if errors:
+        return "unknown", None
+    return "absent", None
 
 
-_extras_checked: set = set()
+# Когда подписку последний раз сверяли с панелями (discord_id -> время).
+_checked: dict = {}
+CHECK_TTL = 6 * 3600
 
 
 async def ensure_extras(sub: dict):
-    """Догоняет доп. серверы для уже существующей подписки: создаёт клиента,
-    если его там нет, и прописывает внешнюю подписку. Раз за запуск бота."""
-    did = sub["discord_id"]
-    if did in _extras_checked or not active_extras():
+    """Доп. серверы для существующей подписки: создаёт клиента, если его там
+    нет, и прописывает внешнюю подписку. Клиент, который есть на доп. сервере,
+    но не привязан к подписке основного, считается устаревшим (например,
+    остался от неудачного перевыпуска) и пересоздаётся с новыми ключами."""
+    panels = configured_extras() if api_mode() else []
+    if not panels:
         return
     email = sub["email"]
     expiry_time = 0
     if sub["kind"] == "trial":
         state, ms = await _panel_expiry_state(sub)
+        if state == "unknown":
+            raise XUIError("срок пробной подписки пока не известен (панель не отвечает)")
         expiry_time = ms if state == "started" else -TRIAL_DAYS * 86_400_000
-    wanted = {}
-    for panel in active_extras():
+    linked = {str(link.get("value") or "") for link in await xui.get_external_links(email, sub["sub_id"])}
+    wanted, missing = {}, []
+    for panel in panels:
+        if panel.api is None:
+            missing.append(panel.name)
+            continue
         found = await panel.api.find_client(email)
-        if not found:
+        url = f"{panel.sub_base}/{found.get('subId')}" if found else None
+        if url is None or url not in linked:
             created = await panel.api.add_client(0, email, 0, ip_limit=DEVICE_LIMIT,
                                                  expiry_time=expiry_time)
-            found = {"subId": created["subId"]}
-            log.info("Клиент %s создан на сервере «%s» при сверке", email, panel.name)
-        wanted[panel.name] = f"{panel.sub_base}/{found.get('subId')}"
-    if not await xui.has_external_links(email, sub["sub_id"], list(wanted.values())):
+            url = f"{panel.sub_base}/{created['subId']}"
+            log.info("Клиент %s на сервере «%s» создан заново при сверке", email, panel.name)
+        wanted[panel.name] = url
+    if set(wanted.values()) - linked:
         await _link_extras(email, sub["sub_id"], wanted)
-    _extras_checked.add(did)
+    if missing:
+        raise XUIError("не подключены серверы: " + ", ".join(missing))
 
 
-async def reissue_link(discord_id: str) -> str:
-    """Новая ссылка и новые ключи: старые конфиги перестают работать на всех
-    серверах. Тип подписки и уже идущий срок сохраняются."""
+async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
+    """Сверяет запись в БД с панелями (не чаще раза в CHECK_TTL на человека).
+    Клиент платной подписки пропал с основного сервера - создаётся заново и
+    человеку уходит новая ссылка. Возвращает True, если клиента восстановили."""
+    did = sub["discord_id"]
+    if xui is None or (not force and time.time() - _checked.get(did, 0) < CHECK_TTL):
+        return False
+    found = await _lookup(xui, sub["email"])
+    if found is None:
+        if sub["kind"] != "paid":
+            # Пробную не пересоздаём (это был бы новый срок): её уберёт check_expired.
+            await notify_admin(f"⚠️ Пробного клиента {sub['email']} нет в панели, а в базе бота он есть.",
+                               key=f"drift:{did}", cooldown=24 * 3600)
+            _checked[did] = time.time()
+            return False
+        link = await _create_sub(did, "paid", member=member, source=_sub_source(sub))
+        await notify_admin(f"🛠 Клиент {sub['email']} пропал из панели и создан заново, "
+                           f"пользователю отправлена новая ссылка.")
+        if member is not None:
+            await send_dm(member, "Ваша VPN-подписка была восстановлена после сбоя. Старая ссылка больше не "
+                                  f"работает, добавьте новую:\n{link}", link)
+        return True
+    panel_sub = found.get("subId") if isinstance(found, dict) else None
+    if panel_sub and panel_sub != sub["sub_id"]:
+        # В панели другой subId (например, базу бота восстановили из бэкапа).
+        db.update_client_ids(did, str(found.get("uuid") or found.get("id") or sub["client_uuid"]), panel_sub)
+        sub = db.get_subscription(did) or sub
+        log.info("subId пользователя %s обновлён по данным панели", did)
+    await ensure_extras(sub)
+    _checked[did] = time.time()
+    return False
+
+
+async def _ensure_quiet(member, sub: dict, actions: list):
+    try:
+        if await ensure_consistent(member, sub):
+            actions.append("restored")
+    except XUIError as e:
+        await notify_admin(f"⚠️ Сверка с панелью для {sub['email']}: {e}", key=f"ensure:{sub['discord_id']}")
+
+
+async def reissue_link(discord_id: str):
+    """Новая ссылка и новые ключи: старые конфиги перестают работать. Тип
+    подписки и уже идущий срок сохраняются. Возвращает (ссылка, [серверы, где
+    ключи заменятся позже])."""
     sub = db.get_subscription(discord_id)
     if not sub:
         raise XUIError("подписки нет")
@@ -522,6 +753,8 @@ async def reissue_link(discord_id: str) -> str:
     expiry_time = 0
     if sub["kind"] == "trial":
         state, ms = await _panel_expiry_state(sub)
+        if state == "unknown":
+            raise XUIError("панель сейчас не отвечает, попробуйте через несколько минут")
         if state == "started":
             if ms <= int(time.time() * 1000):
                 raise XUIError("пробный период уже закончился")
@@ -532,20 +765,133 @@ async def reissue_link(discord_id: str) -> str:
     # клиентом - запоминаем их и возвращаем новому.
     old_links = await xui.get_external_links(email, sub["sub_id"])
     # add_client сам удаляет старого клиента с тем же email и создаёт нового.
-    created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time)
-    extra_subs = await _create_on_extras(email, expiry_time, "")
-    await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
+    # Между удалением и созданием панель может сбойнуть - повторяем.
+    created, last = None, None
+    for attempt in range(3):
+        try:
+            created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time)
+            break
+        except XUIError as e:
+            last = e
+            await asyncio.sleep(1 + attempt)
+    if created is None:
+        _checked.pop(discord_id, None)   # ближайшая сверка восстановит клиента
+        raise last
     db.update_client_ids(discord_id, created["uuid"], created["subId"])
-    _extras_checked.add(discord_id)
-    log.info("Перевыпущена ссылка пользователя %s", discord_id)
-    return sub_link(created["subId"])
-
-
-async def _ensure_extras_quiet(sub: dict):
+    extra_subs, failed = await _create_on_extras(email, expiry_time, "")
     try:
-        await ensure_extras(sub)
+        await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
     except XUIError as e:
-        await notify_admin(f"⚠️ Доп. серверы для {sub['email']}: {e}", key=f"ensure:{sub['discord_id']}")
+        failed.append("внешние ссылки")
+        await notify_admin(f"⚠️ Перевыпуск {email}: не удалось прописать доп. серверы: {e}")
+    # Сервер, где ключи не заменились, остаётся непроверенным: сверка пересоздаст
+    # там клиента, потому что он не привязан к новой подписке.
+    if failed:
+        _checked.pop(discord_id, None)
+    else:
+        _checked[discord_id] = time.time()
+    log.info("Перевыпущена ссылка пользователя %s", discord_id)
+    return sub_link(created["subId"]), [f for f in failed if f != "внешние ссылки"]
+
+
+# ---------- отзыв доступа: отсрочка и ограничение числа удалений ----------
+
+_revoke_log: deque = deque()      # время недавних удалений из-за потери роли
+_revoke_hold = False              # лимит превышен: удаления ждут подтверждения админа
+_revoke_approved_until = 0.0      # до этого момента лимит снят командой /sync confirm
+
+
+def _revoke_limit() -> int:
+    if REVOKE_LIMIT_PER_HOUR > 0:
+        return REVOKE_LIMIT_PER_HOUR
+    total = sum(db.count_subscriptions().values()) + len(_revoke_log)
+    return max(2, math.ceil(total * 0.2))
+
+
+def _revoke_allowed() -> bool:
+    global _revoke_hold
+    now = time.time()
+    if now < _revoke_approved_until:
+        return True
+    if _revoke_hold:
+        return False
+    while _revoke_log and now - _revoke_log[0] > 3600:
+        _revoke_log.popleft()
+    if len(_revoke_log) >= _revoke_limit():
+        _revoke_hold = True
+        return False
+    return True
+
+
+async def _revoke(sub: dict, reason: str, user=None, dm_text: str = "") -> str:
+    """Отзыв доступа из-за потери роли или выхода с сервера.
+    'scheduled' - удаление отложено на REVOKE_GRACE_MINUTES (роль может вернуться);
+    'held'      - за час слишком много удалений, ждём подтверждения админа;
+    'deleted'   - клиент удалён."""
+    did = sub["discord_id"]
+    now = time.time()
+    if REVOKE_GRACE_MINUTES > 0 and not sub.get("revoke_at"):
+        db.set_revoke(did, now + REVOKE_GRACE_MINUTES * 60, reason)
+        log.info("Доступ %s будет отозван через %s мин. (%s)", did, REVOKE_GRACE_MINUTES, reason)
+        return "scheduled"
+    if (sub.get("revoke_at") or 0) > now:
+        return "scheduled"
+    if not _revoke_allowed():
+        if not sub.get("revoke_at"):
+            db.set_revoke(did, now, reason)
+        pending = len(db.list_pending_revokes(due_before=now))
+        await notify_admin(
+            f"🛑 За последний час бот отозвал уже {len(_revoke_log)} подписок, это больше обычного "
+            f"(лимит {_revoke_limit()}). Ещё {pending} ждут удаления и НЕ удаляются, пока вы не проверите "
+            f"роли на сервере. Если всё верно, выполните `/sync confirm:True`. Если роли сняты по ошибке, "
+            f"верните их: удаление отменится само.",
+            key="revoke_hold", cooldown=3600,
+        )
+        return "held"
+    try:
+        await _delete_sub(sub, reason=reason)
+    except XUIError:
+        # Не удалось удалить везде: запись остаётся с отметкой «пора удалить»,
+        # revoke_loop повторит попытку через минуту.
+        if not sub.get("revoke_at"):
+            db.set_revoke(did, now, reason)
+        raise
+    _revoke_log.append(now)
+    if user is not None and dm_text:
+        await send_dm(user, dm_text)
+    return "deleted"
+
+
+async def process_due_revokes() -> Counter:
+    """Удаляет тех, у кого истекла отсрочка и роль не вернулась."""
+    global _revoke_hold
+    stats = Counter()
+    if xui is None or not _guild_ready():
+        return stats
+    for sub in db.list_pending_revokes(due_before=time.time()):
+        did = sub["discord_id"]
+        member = find_member(int(did))
+        try:
+            if member is not None:
+                for action in await sync_member(member, quiet=True):
+                    stats[action] += 1
+                continue
+            async with _member_lock(did):
+                sub = db.get_subscription(did)
+                if not sub or not sub.get("revoke_at"):
+                    continue
+                result = await _revoke(sub, sub.get("revoke_reason") or "left")
+                stats["revoked" if result == "deleted" else result] += 1
+        except XUIError as e:
+            stats["errors"] += 1
+            await notify_admin(f"⚠️ Не удалось отозвать доступ {did}: {e}", key=f"revoke:{did}")
+        except Exception as e:
+            stats["errors"] += 1
+            log.exception("Ошибка отзыва доступа %s", did)
+            await notify_admin(f"⚠️ Ошибка отзыва доступа {did}: {e!r}", key=f"revoke:{did}")
+    if _revoke_hold and not db.list_pending_revokes(due_before=time.time()):
+        _revoke_hold = False   # ждать больше нечего: роли вернули или всё удалено
+    return stats
 
 
 async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = False) -> list:
@@ -554,36 +900,39 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
     trial_just_added - роль Trial только что выдали (для пояснений в ЛС);
     quiet            - не слать пояснительные сообщения без изменений
                        (используется периодической сверкой).
-    Возвращает список выполненных действий: 'granted', 'upgraded', 'trial', 'revoked'.
+    Возвращает список действий: 'granted', 'upgraded', 'trial', 'revoked',
+    'scheduled' (удаление отложено), 'held' (ждёт подтверждения), 'restored'.
     Бросает XUIError, если панель не дала выполнить операцию.
     """
     discord_id = str(member.id)
     actions = []
     async with _member_lock(discord_id):
-        names = _role_names(member)
-        has_vpn = bool(names & PAID_ROLES)
-        has_trial = TRIAL_ROLE_NAME in names
+        kinds = access(member)
+        has_vpn = bool(kinds & PAID_KINDS)
+        has_trial = "trial" in kinds
         sub = db.get_subscription(discord_id)
 
         # 1. Платная роль - главный приоритет.
         if has_vpn:
             if sub and sub["kind"] == "paid":
+                if sub.get("revoke_at"):
+                    db.clear_revoke(discord_id)   # роль вернулась до конца отсрочки
+                    log.info("Роль вернулась, отзыв доступа %s отменён", discord_id)
                 if trial_just_added and not quiet:
                     await send_dm(member, "У вас уже есть платная подписка, пробный период не нужен. "
                                           "Ссылка - в `/myvpn`.")
-                await _ensure_extras_quiet(sub)
+                await _ensure_quiet(member, sub, actions)
                 return actions
             upgraded = sub is not None
             if sub:
-                # Был trial: панель не даёт редактировать клиента запросом,
-                # поэтому пересоздаём его уже бессрочным.
+                # Был trial: пересоздаём клиента уже бессрочным.
                 await _delete_sub(sub)
-            boosty = VPN_ROLE_NAME in names
+            boosty = "boosty" in kinds
             source = "boosty" if boosty else "gift"
             link = await _create_sub(discord_id, "paid", member=member, source=source)
             db.log_event(discord_id, "trial_to_paid" if upgraded else "paid_start", source=source)
             actions.append("upgraded" if upgraded else "granted")
-            role = VPN_ROLE_NAME if boosty else sorted(names & VPN_GIFT_ROLES)[0]
+            role = role_title(member, "boosty" if boosty else "gift")
             if boosty:
                 head = "Оплата на Boosty получена, спасибо! ✅"
             else:
@@ -599,24 +948,38 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
             await send_dm(member, text, link)
             return actions
 
-        # 2. Платной роли нет, а платная подписка осталась - отзываем.
+        # 2. Платной роли нет, а платная подписка осталась - отзываем (с отсрочкой).
         if sub and sub["kind"] == "paid":
-            await _delete_sub(sub, reason="role_removed")
+            result = await _revoke(
+                sub, "role_removed", member,
+                "Роль доступа к NEXUS VPN снята, VPN отключён.\n"
+                "Если это ошибка или вы продолжаете оплачивать подписку на Boosty, напишите в /support.")
+            if result != "deleted":
+                actions.append(result)
+                return actions
             sub = None
             actions.append("revoked")
-            await send_dm(member, "Роль доступа к NEXUS VPN снята, VPN отключён.\n"
-                                  "Если это ошибка или вы продолжаете оплачивать подписку на Boosty, "
-                                  "напишите в /support.")
 
         # 3. Пробный период.
         if has_trial:
             if sub:  # trial уже идёт
-                await _ensure_extras_quiet(sub)
+                if sub.get("revoke_at"):
+                    db.clear_revoke(discord_id)
+                await _ensure_quiet(member, sub, actions)
                 return actions
             if db.has_used_trial(discord_id):
                 if trial_just_added and not quiet:
                     await send_dm(member, "Пробный период уже был использован и доступен только один раз. "
                                           "Оформите подписку на Boosty, чтобы получить постоянный доступ.")
+                return actions
+            age_days = _account_age_days(member)
+            if TRIAL_MIN_ACCOUNT_AGE_DAYS > 0 and age_days is not None and age_days < TRIAL_MIN_ACCOUNT_AGE_DAYS:
+                if trial_just_added and not quiet:
+                    await send_dm(member, f"Пробный период доступен аккаунтам Discord старше "
+                                          f"{TRIAL_MIN_ACCOUNT_AGE_DAYS} {_plural_days(TRIAL_MIN_ACCOUNT_AGE_DAYS)}. "
+                                          f"Напишите в /support, если это ошибка.")
+                    await notify_admin(f"ℹ️ {member} ({member.id}) не получил trial: аккаунту {age_days} дн.",
+                                       key=f"age:{member.id}", cooldown=24 * 3600)
                 return actions
             link = await _create_sub(discord_id, "trial", member=member, source="trial")
             # Помечаем использованным только после успешной выдачи.
@@ -636,10 +999,17 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
 
         # 4. Ролей нет, а trial-подписка осталась (роль Trial сняли вручную).
         if sub:
-            await _delete_sub(sub, reason="trial_role_removed")
-            actions.append("revoked")
-            await send_dm(member, "Роль пробного периода снята, доступ к VPN отозван.")
+            result = await _revoke(sub, "trial_role_removed", member,
+                                   "Роль пробного периода снята, доступ к VPN отозван.")
+            actions.append("revoked" if result == "deleted" else result)
         return actions
+
+
+def _account_age_days(member):
+    created = getattr(member, "created_at", None)
+    if created is None:
+        return None
+    return (datetime.now(timezone.utc) - created).days
 
 
 async def _safe_sync(member, **kwargs):
@@ -724,13 +1094,18 @@ class ConfirmReissueView(discord.ui.View):
         discord_id = str(self.owner_id)
         try:
             async with _member_lock(discord_id):
-                link = await reissue_link(discord_id)
+                link, failed = await reissue_link(discord_id)
         except XUIError as e:
             await interaction.followup.send(f"Не получилось перевыпустить ссылку: {e}", ephemeral=True)
             return
         _reissue_times[self.owner_id] = now
         text = ("Ссылка перевыпущена ✅ Старая и все добавленные по ней конфиги больше не работают.\n"
                 f"Добавьте новую подписку в приложение заново:\n{link}")
+        if failed:
+            text += ("\n\n⚠️ Серверы " + ", ".join(failed) + " сейчас недоступны - они появятся в подписке "
+                     "автоматически, когда снова заработают (обновите подписку в приложении позже).")
+            await notify_admin(f"⚠️ Перевыпуск для {discord_id}: не созданы клиенты на " + ", ".join(failed),
+                               key=f"reissue:{discord_id}")
         view = nexus_view(link)
         if view is not None:
             await interaction.followup.send(text, file=make_qr_file(link), view=view, ephemeral=True)
@@ -770,7 +1145,7 @@ async def _traffic_total(email: str):
     """Суммарный трафик по всем серверам: (up, down) в байтах или None."""
     up = down = 0
     found = False
-    for client_api in [xui] + [p.api for p in active_extras()]:
+    for client_api in _all_apis():
         t = await client_api.get_client_traffic(email)
         if t:
             found = True
@@ -790,7 +1165,7 @@ async def myvpn(interaction: discord.Interaction):
         # выключен в момент выдачи роли) - выдаём прямо сейчас.
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         member = member or find_member(interaction.user.id)
-        if member and _role_names(member) & PAID_ROLES | {TRIAL_ROLE_NAME}:
+        if member and access(member) & WATCHED_KINDS:
             await _safe_sync(member, quiet=True)
             sub = db.get_subscription(discord_id)
 
@@ -1201,12 +1576,26 @@ async def _bot_avatar() -> bytes | None:
     return data
 
 
+async def _check_target(panel) -> str:
+    """Что проверять из РФ: адрес из .env, а если его нет - порт VPN-подключения
+    из панели (порт подписок может быть открыт, когда сам VPN заблокирован)."""
+    if panel.check_explicit or not isinstance(panel.api, XUIApi):
+        return panel.check_target
+    host = (panel.check_target or "").rsplit(":", 1)[0]
+    try:
+        port = await panel.api.tcp_port()
+    except XUIError as e:
+        log.warning("Порт VPN сервера «%s»: %s", panel.name, e)
+        port = None
+    return f"{host}:{port}" if host and port else panel.check_target
+
+
 async def _collect_servers() -> list:
     """Строки серверов для карточки: Xray доп. серверов через API и
     доступность всех серверов из РФ."""
-    servers = [{"name": primary.name, "xray": None, "rf": None, "target": primary.check_target}]
+    servers = [{"name": primary.name, "xray": None, "rf": None, "target": await _check_target(primary)}]
     for panel in active_extras():
-        row = {"name": panel.name, "xray": None, "rf": None, "target": panel.check_target}
+        row = {"name": panel.name, "xray": None, "rf": None, "target": await _check_target(panel)}
         try:
             st = await panel.api.server_status()
             row["xray"] = str((st.get("xray") or {}).get("state", "")).lower() == "running"
@@ -1309,7 +1698,7 @@ async def revoke(interaction: discord.Interaction, member: discord.Member, remov
 
         roles_note = ""
         if remove_roles:
-            to_remove = [r for r in member.roles if r.name in PAID_ROLES | {TRIAL_ROLE_NAME}]
+            to_remove = [r for r in member.roles if role_kinds(r) & WATCHED_KINDS]
             if to_remove:
                 try:
                     await member.remove_roles(*to_remove, reason=f"/revoke от {interaction.user}")
@@ -1326,12 +1715,19 @@ async def revoke(interaction: discord.Interaction, member: discord.Member, remov
 
 
 @tree.command(name="sync", description="[Админ] Сверить роли участников с VPN-подписками")
-async def sync_cmd(interaction: discord.Interaction):
+@app_commands.describe(confirm="Подтвердить массовое удаление, которое бот приостановил")
+async def sync_cmd(interaction: discord.Interaction, confirm: bool = False):
+    global _revoke_hold, _revoke_approved_until
     if not is_admin(interaction):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    stats = await reconcile()
+    if confirm:
+        # Админ подтвердил: следующие 10 минут удаления идут без лимита.
+        _revoke_hold = False
+        _revoke_approved_until = time.time() + 600
+        await notify_admin(f"✅ {interaction.user} подтвердил отложенные удаления (`/sync confirm:True`).")
+    stats = await reconcile(force_check=True)
     await interaction.followup.send(_format_stats(stats), ephemeral=True)
 
 
@@ -1395,6 +1791,73 @@ def stats_text() -> str:
         "серверы: " + ", ".join([primary.name] + [p.name for p in active_extras()]),
     ]
     return "\n".join(lines)[:1990]
+
+
+@tree.command(name="audit", description="[Админ] Состояние панелей, фоновых задач и подписок")
+@app_commands.describe(delete_orphans="Удалить из панелей клиентов бота, которых нет в базе")
+async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = False):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
+    for p in extra_panels:
+        if p not in configured_extras():
+            state = "⚪ не настроен (нужны токен и адрес подписок)"
+        else:
+            state = "✅ подключён" if p.api is not None else "🔴 не подключён"
+        lines.append(f"**{p.name}:** {state}")
+    if xui is not None and not api_mode():
+        lines.append("⚠️ Резервный режим через браузер: если обновится интерфейс панели, выдача может "
+                     "сломаться. Надёжнее перейти на XUI_API_TOKEN.")
+    loops = ", ".join(f"{n} {'✅' if l.is_running() else '🔴'}" for n, l in BACKGROUND_LOOPS.items())
+    lines.append(f"**Фоновые задачи:** {loops or 'ещё не запущены'}")
+    gid = home_guild_id()
+    lines.append(f"**Свой сервер Discord:** {gid or 'не определён (задайте GUILD_ID)'}")
+    foreign = [g for g in client.guilds if g.id != gid]
+    if foreign:
+        lines.append("🚨 **Посторонние серверы:** " + ", ".join(f"{g.name} ({g.id})" for g in foreign[:10]))
+    counts = db.count_subscriptions()
+    lines.append("**Подписки:** " + (", ".join(f"{k}: {v}" for k, v in counts.items()) or "нет"))
+    pending = db.list_pending_revokes()
+    if pending:
+        now = time.time()
+        lines.append(f"**Ждут удаления ({len(pending)}):** " + ", ".join(
+            f"<@{r['discord_id']}> ({'сейчас' if (r['revoke_at'] or 0) <= now else f'через {int(((r['revoke_at'] or 0) - now) // 60) + 1} мин.'})"
+            for r in pending[:15]))
+    if _revoke_hold:
+        lines.append("🛑 Удаления приостановлены (лимит за час). Подтвердить: `/sync confirm:True`.")
+    if api_mode():
+        try:
+            orphans = await find_orphans()
+        except XUIError as e:
+            orphans = {}
+            lines.append(f"⚠️ Не удалось проверить клиентов панелей: {e}")
+        total = sum(len(v) for v in orphans.values())
+        if total:
+            lines.append(f"**Клиенты без записи в базе ({total}):** " + "; ".join(
+                f"{k}: {', '.join(v[:10])}" for k, v in orphans.items()))
+            if delete_orphans:
+                apis = {primary.name: xui, **{p.name: p.api for p in active_extras()}}
+                removed, errors = 0, []
+                for name, emails in orphans.items():
+                    for email in emails:
+                        if db.get_subscription(email.removeprefix("discord_")):
+                            continue   # запись появилась, пока шла проверка
+                        try:
+                            await apis[name].delete_client(0, "", email)
+                            removed += 1
+                        except XUIError as e:
+                            errors.append(f"{name}/{email}: {e}")
+                lines.append(f"🗑 Удалено клиентов без записи: {removed}" +
+                             (f". Ошибки: {'; '.join(errors[:5])}" if errors else ""))
+                await notify_admin(f"🗑 {interaction.user} удалил {removed} клиентов без записи в базе (`/audit`).")
+            else:
+                lines.append("Удалить их: `/audit delete_orphans:True`.")
+        else:
+            lines.append("**Клиенты без записи в базе:** нет")
+    text = "\n".join(lines)
+    await interaction.followup.send(text[:1990], ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @tree.command(name="vpn_stats", description="[Админ] Подписки, конверсия пробного периода и опрос")
@@ -1573,7 +2036,7 @@ async def support_cmd(interaction: discord.Interaction, topic: str = ""):
             reason=f"/support от {interaction.user}",
         )
         await thread.add_user(interaction.user)
-        admin_role = discord.utils.get(channel.guild.roles, name=ADMIN_ROLE_NAME)
+        admin_role = next((r for r in channel.guild.roles if "admin" in role_kinds(r)), None)
         if admin_role is not None:
             for admin in admin_role.members[:10]:
                 try:
@@ -1586,7 +2049,8 @@ async def support_cmd(interaction: discord.Interaction, topic: str = ""):
             f"Опишите проблему: на каком устройстве и в каком приложении, что именно не работает. "
             f"Скриншоты помогут. Когда вопрос решён - нажмите кнопку ниже.",
             view=TicketCloseView(),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            allowed_mentions=discord.AllowedMentions(everyone=False, users=[interaction.user],
+                                                     roles=[admin_role] if admin_role else False),
         )
     except discord.HTTPException as e:
         log.error("Не удалось создать ветку поддержки: %s", e)
@@ -1689,7 +2153,7 @@ async def announce_cmd(interaction: discord.Interaction, audience: app_commands.
 
 async def _client_ips(email: str) -> list:
     entries = []
-    for client_api in [xui] + [p.api for p in active_extras()]:
+    for client_api in _all_apis():
         try:
             entries += await client_api.get_client_ips(email)
         except XUIError as e:
@@ -1760,19 +2224,21 @@ async def _check_sharing_error(error):
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     """Boosty выдаёт роль при оплате и снимает при отмене/просрочке - бот
-    замечает это и приводит VPN-доступ в соответствие."""
-    before_names = _role_names(before)
-    after_names = _role_names(after)
-    watched = PAID_ROLES | {TRIAL_ROLE_NAME}
-    if (before_names ^ after_names) & watched:
-        trial_just_added = TRIAL_ROLE_NAME in after_names and TRIAL_ROLE_NAME not in before_names
+    замечает это и приводит VPN-доступ в соответствие. События с других
+    серверов игнорируются."""
+    if not _is_home(getattr(after, "guild", None)) and getattr(after, "guild", None) is not None:
+        return
+    before_kinds = access(before) & WATCHED_KINDS
+    after_kinds = access(after) & WATCHED_KINDS
+    if before_kinds != after_kinds:
+        trial_just_added = "trial" in after_kinds and "trial" not in before_kinds
         await _safe_sync(after, trial_just_added=trial_just_added)
 
 
 @client.event
 async def on_member_remove(member: discord.Member):
     """Человек вышел с сервера - роли пропали, а on_member_update не придёт."""
-    if find_member(member.id):  # остался на другом сервере бота - решит сверка
+    if getattr(member, "guild", None) is not None and not _is_home(member.guild):
         return
     discord_id = str(member.id)
     async with _member_lock(discord_id):
@@ -1780,16 +2246,25 @@ async def on_member_remove(member: discord.Member):
         if not sub:
             return
         try:
-            await _delete_sub(sub, reason="left")
-            await send_dm(member, "Вы покинули сервер, поэтому доступ к VPN отозван.")
+            await _revoke(sub, "left", member, "Вы покинули сервер, поэтому доступ к VPN отозван.")
         except XUIError as e:
             await notify_admin(f"⚠️ {member} ({member.id}) вышел с сервера, но удалить VPN не удалось: {e}",
                                key=f"leave:{member.id}")
 
 
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    if not _is_home(guild):
+        await notify_admin(
+            f"🚨 Бота добавили на посторонний сервер «{guild.name}» ({guild.id}). Роли и команды там не "
+            f"действуют. Если это не вы, удалите бота с этого сервера и выключите «Public Bot» в "
+            f"Discord Developer Portal → Bot.")
+
+
 # ---------- сверка ролей и подписок ----------
 
 _reconcile_lock = asyncio.Lock()
+_last_orphan_check = 0.0
 
 
 def _format_stats(stats: Counter) -> str:
@@ -1802,78 +2277,81 @@ def _format_stats(stats: Counter) -> str:
         f"Выдано пробных: {stats.get('trial', 0)}",
         f"Отозвано: {stats.get('revoked', 0)}",
     ]
+    if stats.get("restored"):
+        parts.append(f"Восстановлено пропавших клиентов: {stats['restored']}")
+    if stats.get("scheduled"):
+        parts.append(f"Ждут конца отсрочки ({REVOKE_GRACE_MINUTES} мин.): {stats['scheduled']}")
+    if stats.get("held"):
+        parts.append(f"🛑 Не удалено, ждут подтверждения (`/sync confirm:True`): {stats['held']}")
+    if stats.get("orphans"):
+        parts.append(f"Клиентов в панели без записи в базе: {stats['orphans']} (см. `/audit`)")
     if stats.get("errors"):
         parts.append(f"Ошибок: {stats['errors']} (подробности в админ-канале/логе)")
-    if stats.get("guarded"):
-        parts.append(f"⚠️ Не удалено из-за защиты от массового удаления: {stats['guarded']}")
     return "\n".join(parts)
 
 
-async def reconcile() -> Counter:
+def _skip(stats: Counter, reason: str) -> Counter:
+    stats.update(skipped=1)
+    stats["reason"] = reason
+    return stats
+
+
+async def find_orphans() -> dict:
+    """Клиенты discord_<id> в панелях, которых нет в базе бота: {сервер: [email]}.
+    Такие клиенты работают, но бот ими не управляет."""
+    known = {s["email"] for s in db.list_subscriptions()}
+    out = {}
+    panels = [(primary.name, xui)] + [(p.name, p.api) for p in active_extras()]
+    for name, api in panels:
+        if not isinstance(api, XUIApi):
+            continue
+        emails = await api.list_emails()
+        lost = sorted(e for e in emails if re.fullmatch(r"discord_\d+", e) and e not in known)
+        if lost:
+            out[name] = lost
+    return out
+
+
+async def reconcile(force_check: bool = False) -> Counter:
     """Догоняет изменения ролей, которые бот пропустил (был выключен,
-    перезапускался, упал браузер и т.п.)."""
+    перезапускался, панель была недоступна), и сверяет базу с панелями."""
+    global _last_orphan_check
     stats = Counter()
     if xui is None:
-        stats.update(skipped=1)
-        stats["reason"] = "нет подключения к панели"
-        return stats
+        return _skip(stats, "нет подключения к панели")
+    guild = home_guild()
+    if guild is None:
+        if len(client.guilds) > 1:
+            await notify_admin("⚠️ Бот состоит в нескольких серверах, а GUILD_ID в .env не задан. Роли не "
+                               "обрабатываются, пока не указан свой сервер.", key="no_guild")
+            return _skip(stats, "не задан GUILD_ID, а серверов несколько")
+        return _skip(stats, "бот не видит свой сервер Discord")
+    if getattr(guild, "unavailable", False):
+        return _skip(stats, "сервер Discord временно недоступен")
 
     async with _reconcile_lock:
-        watched = PAID_ROLES | {TRIAL_ROLE_NAME}
-        members: dict = {}
         all_chunked = True
-        roles_exist = False
-        for g in client.guilds:
-            if not g.chunked:
-                try:
-                    await g.chunk()
-                except Exception as e:
-                    log.warning("Не удалось загрузить участников сервера %s: %s", g.id, e)
-                    all_chunked = False
-            if any(r.name in watched for r in g.roles):
-                roles_exist = True
-            for m in g.members:
-                if m.bot:
-                    continue
-                key = str(m.id)
-                prev = members.get(key)
-                if prev is None or (not (_role_names(prev) & watched) and _role_names(m) & watched):
-                    members[key] = m
-
-        if not roles_exist:
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except Exception as e:
+                log.warning("Не удалось загрузить участников сервера %s: %s", guild.id, e)
+                all_chunked = False
+        if not any(role_kinds(r) & WATCHED_KINDS for r in guild.roles):
             # Роль переименовали/удалили - не трогаем подписки, иначе удалили бы всех.
             names = ", ".join(f"«{r}»" for r in sorted(PAID_ROLES | {TRIAL_ROLE_NAME}))
             await notify_admin(f"⚠️ Сверка пропущена: на сервере нет ни одной из ролей {names}. "
-                               f"Проверьте VPN_ROLE_NAME, VPN_GIFT_ROLES и TRIAL_ROLE_NAME.",
-                               key="no_roles")
-            stats.update(skipped=1)
-            stats["reason"] = "на сервере нет VPN-ролей"
-            return stats
+                               f"Проверьте названия или ID ролей в .env.", key="no_roles")
+            return _skip(stats, "на сервере нет VPN-ролей")
 
+        members = {str(m.id): m for m in guild.members if not m.bot}
         subs = {s["discord_id"]: s for s in db.list_subscriptions()}
+        if force_check:
+            _checked.clear()
 
         # Кому нужно что-то сделать: у кого есть роль, и у кого есть подписка.
-        to_check = {did for did, m in members.items() if _role_names(m) & watched}
+        to_check = {did for did, m in members.items() if access(m) & WATCHED_KINDS}
         to_check |= {did for did in subs if did in members}
-        absent = [s for did, s in subs.items() if did not in members] if all_chunked else []
-
-        # Защита от массового удаления (например, Boosty-интеграция отвалилась
-        # и разом сняла роли): если удалить надо больше половины подписок -
-        # ничего не удаляем и сообщаем админам.
-        planned_revokes = [did for did in to_check
-                           if did in subs and not (_role_names(members[did]) & watched)]
-        planned_total = len(planned_revokes) + len(absent)
-        guard = planned_total > max(5, len(subs) // 2)
-        if guard:
-            stats["guarded"] = planned_total
-            await notify_admin(
-                f"⚠️ Сверка хотела удалить {planned_total} из {len(subs)} подписок - это подозрительно "
-                f"много, удаление пропущено. Проверьте роли на сервере, затем запустите /sync.",
-                key="mass_revoke", cooldown=3600,
-            )
-            to_check -= set(planned_revokes)
-            absent = []
-
         for did in to_check:
             stats["checked"] += 1
             try:
@@ -1883,19 +2361,47 @@ async def reconcile() -> Counter:
                 stats["errors"] += 1
                 await notify_admin(f"⚠️ Сверка: ошибка для {members[did]} ({did}): {e}", key=f"sync:{did}")
 
-        for sub in absent:
-            async with _member_lock(sub["discord_id"]):
-                if db.get_subscription(sub["discord_id"]) is None:
+        # Участника нет на сервере. Только если список участников загружен полностью.
+        if all_chunked:
+            for did, sub in subs.items():
+                if did in members:
                     continue
-                try:
-                    await _delete_sub(sub, reason="left")
-                    stats["revoked"] += 1
-                except Exception as e:
-                    stats["errors"] += 1
-                    await notify_admin(f"⚠️ Сверка: не удалось удалить подписку ушедшего {sub['discord_id']}: {e}",
-                                       key=f"sync:{sub['discord_id']}")
+                async with _member_lock(did):
+                    sub = db.get_subscription(did)
+                    if sub is None:
+                        continue
+                    try:
+                        result = await _revoke(sub, "left")
+                        stats["revoked" if result == "deleted" else result] += 1
+                    except Exception as e:
+                        stats["errors"] += 1
+                        await notify_admin(f"⚠️ Сверка: не удалось удалить подписку ушедшего {did}: {e}",
+                                           key=f"sync:{did}")
 
-    changed = sum(stats.get(k, 0) for k in ("granted", "upgraded", "trial", "revoked"))
+        if api_mode() and (force_check or time.time() - _last_orphan_check > CHECK_TTL):
+            try:
+                orphans = await find_orphans()
+                _last_orphan_check = time.time()
+                total = sum(len(v) for v in orphans.values())
+                if total:
+                    stats["orphans"] = total
+                    await notify_admin(
+                        f"🔎 В панелях есть {total} клиентов бота без записи в базе (они работают, но бот ими "
+                        f"не управляет): " + "; ".join(f"{k}: {', '.join(v[:10])}" for k, v in orphans.items())
+                        + ". Посмотреть и удалить: `/audit`.", key="orphans", cooldown=24 * 3600)
+            except XUIError as e:
+                log.warning("Поиск клиентов без записи в базе: %s", e)
+
+    due = await process_due_revokes()
+    for key in ("revoked", "errors"):
+        stats[key] += due.get(key, 0)
+    if _revoke_hold:
+        stats["held"] = len(db.list_pending_revokes(due_before=time.time()))
+    stats["scheduled"] = len(db.list_pending_revokes()) - stats.get("held", 0)
+    if stats["scheduled"] <= 0:
+        del stats["scheduled"]
+
+    changed = sum(stats.get(k, 0) for k in ("granted", "upgraded", "trial", "revoked", "restored"))
     log.info("Сверка завершена: %s", dict(stats))
     if changed or stats.get("errors"):
         await notify_admin("🔄 Сверка ролей:\n" + _format_stats(stats))
@@ -1908,6 +2414,15 @@ async def reconcile_loop():
         await reconcile()
     except Exception:
         log.exception("Ошибка периодической сверки")
+
+
+@tasks.loop(minutes=1)
+async def revoke_loop():
+    """Раз в минуту удаляет тех, у кого закончилась отсрочка."""
+    try:
+        await process_due_revokes()
+    except Exception:
+        log.exception("Ошибка в revoke_loop")
 
 
 # ---------- фоновая проверка истёкших пробных подписок ----------
@@ -1930,113 +2445,152 @@ async def _remind_trial(discord_id: str, exp_ms: int, days: int):
     log.info("Напоминание о конце trial (%s дн.) отправлено %s", days, discord_id)
 
 
+async def _expire_one(discord_id: str, now_ms: int):
+    """Одна пробная подписка: напоминание или удаление по окончании срока."""
+    member = None
+    async with _member_lock(discord_id):
+        sub = db.get_subscription(discord_id)
+        if not sub or not sub["expiry_ms"]:
+            return
+
+        state, panel_ms = await _panel_expiry_state(sub)
+        if state in ("not_started", "unknown"):
+            # Не подключался - срок не начался. Панель не ответила - ничего не
+            # решаем вслепую, проверим через час.
+            return
+        if state == "started":
+            if panel_ms != sub["expiry_ms"]:
+                db.update_expiry(discord_id, panel_ms)
+            exp = panel_ms
+        else:
+            exp = sub["expiry_ms"]  # клиента в панелях нет - чистим по данным бота
+
+        left = exp - now_ms
+        if left > 0:
+            flags = sub.get("reminders") or 0
+            if state == "started" and left <= 86_400_000 and not flags & db.REMIND_1D:
+                db.add_reminder_flag(discord_id, db.REMIND_1D | db.REMIND_2D)
+                await _remind_trial(discord_id, exp, 1)
+            elif state == "started" and left <= 2 * 86_400_000 and not flags & db.REMIND_2D:
+                db.add_reminder_flag(discord_id, db.REMIND_2D)
+                await _remind_trial(discord_id, exp, 2)
+            return
+
+        try:
+            await _delete_sub(sub, reason="trial_expired")
+        except XUIError as e:
+            await notify_admin(f"⚠️ Не удалось удалить истёкшую подписку {discord_id}: {e}",
+                               key=f"expire:{discord_id}")
+            return
+
+        member = find_member(int(discord_id))
+        if REMOVE_TRIAL_ROLE_ON_EXPIRY and member is not None:
+            roles = [r for r in member.roles if "trial" in role_kinds(r)]
+            if roles:
+                try:
+                    await member.remove_roles(*roles, reason="Пробный период закончился")
+                except discord.HTTPException as e:
+                    log.warning("Не удалось снять роль Trial у %s: %s", discord_id, e)
+
+    target = member
+    if target is None:
+        try:
+            target = await client.fetch_user(int(discord_id))
+        except discord.HTTPException:
+            target = None
+    if target is not None:
+        try:
+            await target.send(
+                "Пробный период NEXUS VPN закончился, доступ отключён." + _boosty_hint() +
+                "\n\nПочему вы не стали продолжать? Нажмите вариант, это займёт секунду "
+                "и поможет нам сделать VPN лучше.",
+                view=SurveyView(),
+            )
+        except discord.HTTPException:
+            log.info("Не удалось написать в ЛС пользователю %s", discord_id)
+
+
 @tasks.loop(hours=1)
 async def check_expired():
     """Пробные подписки: напоминания за 2 дня и за 1 день, удаление по окончании.
     Срок берётся с панелей: при «Start After First Use» он идёт с первого
-    подключения (на любом из серверов)."""
-    now_ms = int(time.time() * 1000)
-
-    for sub in db.list_expiring():
-        discord_id = sub["discord_id"]
-        member = None
-        async with _member_lock(discord_id):
-            sub = db.get_subscription(discord_id)
-            if not sub or not sub["expiry_ms"]:
-                continue
-
-            state, panel_ms = await _panel_expiry_state(sub)
-            if state == "not_started":
-                continue  # ещё ни разу не подключался - срок не начался
-            if state == "started":
-                if panel_ms != sub["expiry_ms"]:
-                    db.update_expiry(discord_id, panel_ms)
-                exp = panel_ms
-            else:
-                exp = sub["expiry_ms"]  # панели не ответили - по данным бота
-
-            left = exp - now_ms
-            if left > 0:
-                flags = sub.get("reminders") or 0
-                if state == "started" and left <= 86_400_000 and not flags & db.REMIND_1D:
-                    db.add_reminder_flag(discord_id, db.REMIND_1D | db.REMIND_2D)
-                    await _remind_trial(discord_id, exp, 1)
-                elif state == "started" and left <= 2 * 86_400_000 and not flags & db.REMIND_2D:
-                    db.add_reminder_flag(discord_id, db.REMIND_2D)
-                    await _remind_trial(discord_id, exp, 2)
-                continue
-
+    подключения (на любом из серверов). Ошибка на одной подписке не должна
+    останавливать задачу: tasks.loop после исключения больше не запускается."""
+    try:
+        if xui is None:
+            return
+        now_ms = int(time.time() * 1000)
+        for sub in db.list_expiring():
             try:
-                await _delete_sub(sub, reason="trial_expired")
-            except XUIError as e:
-                await notify_admin(f"⚠️ Не удалось удалить истёкшую подписку {discord_id}: {e}",
-                                   key=f"expire:{discord_id}")
-                continue
-
-            member = find_member(int(discord_id))
-            if REMOVE_TRIAL_ROLE_ON_EXPIRY and member is not None:
-                role = discord.utils.get(member.roles, name=TRIAL_ROLE_NAME)
-                if role is not None:
-                    try:
-                        await member.remove_roles(role, reason="Пробный период закончился")
-                    except discord.HTTPException as e:
-                        log.warning("Не удалось снять роль Trial у %s: %s", discord_id, e)
-
-        target = member
-        if target is None:
-            try:
-                target = await client.fetch_user(int(discord_id))
-            except discord.HTTPException:
-                target = None
-        if target is not None:
-            try:
-                await target.send(
-                    "Пробный период NEXUS VPN закончился, доступ отключён." + _boosty_hint() +
-                    "\n\nПочему вы не стали продолжать? Нажмите вариант, это займёт секунду "
-                    "и поможет нам сделать VPN лучше.",
-                    view=SurveyView(),
-                )
-            except discord.HTTPException:
-                log.info("Не удалось написать в ЛС пользователю %s", discord_id)
+                await _expire_one(sub["discord_id"], now_ms)
+            except Exception as e:
+                log.exception("Ошибка проверки срока подписки %s", sub["discord_id"])
+                await notify_admin(f"⚠️ Ошибка проверки срока {sub['discord_id']}: {e!r}",
+                                   key=f"expire_err:{sub['discord_id']}")
+    except Exception:
+        log.exception("Ошибка в check_expired")
 
 
-@check_expired.error
-async def _check_expired_error(error):
-    log.exception("Ошибка в check_expired", exc_info=error)
+# ---------- копия базы вне сервера ----------
+
+@tasks.loop(hours=24)
+async def db_backup_loop():
+    """Раз в сутки отправляет копию базы в закрытый канал Discord: если диск
+    сервера погибнет, локальные бэкапы погибнут вместе с ним."""
+    if not DB_BACKUP_WEBHOOK_URL:
+        return
+    tmp = db.DB_PATH + ".upload"
+    try:
+        await asyncio.to_thread(db.backup_to, tmp)
+        with open(tmp, "rb") as f:
+            data = f.read()
+        name = time.strftime("subscriptions_%Y%m%d.db")
+        webhook = discord.Webhook.from_url(DB_BACKUP_WEBHOOK_URL, client=client)
+        await webhook.send("Копия базы бота", file=discord.File(io.BytesIO(data), filename=name),
+                           username="NEXUS_VPN Backup", allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        log.exception("Не удалось отправить копию базы")
+        await notify_admin(f"⚠️ Не удалось отправить копию базы: {e!r}", key="db_backup")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
-# ---------- запуск ----------
+# ---------- подключение к панелям ----------
 
-async def _setup():
+async def _connect_primary() -> bool:
     global xui
     try:
         if XUI_API_TOKEN:
-            log.info("Подключаюсь к панели 3x-ui «%s» через API-токен...", primary.name)
-            xui = await XUIApi.create(
+            api = await XUIApi.create(
                 XUI_BASE_URL, XUI_API_TOKEN, verify_ssl=XUI_VERIFY_SSL,
                 web_base_path=XUI_WEB_BASE_PATH, name=primary.name, inbound_ids=XUI_INBOUND_IDS,
             )
         else:
-            log.info("Подключаюсь к панели 3x-ui (headless-браузер, может занять 10-20 секунд)...")
-            xui = await XUIClient.create(
+            api = await XUIClient.create(
                 XUI_BASE_URL, XUI_USERNAME, XUI_PASSWORD,
                 verify_ssl=XUI_VERIFY_SSL, web_base_path=XUI_WEB_BASE_PATH,
                 static_csrf_token=XUI_STATIC_CSRF_TOKEN,
             )
-        primary.api = xui
-        log.info("Подключение к 3x-ui успешно (%s).", xui.login_debug_info)
     except XUIError as e:
-        log.error("НЕ УДАЛОСЬ подключиться к 3x-ui: %s", e)
-        log.error("Запустите `python test_connection.py` для подробной диагностики.")
-        raise SystemExit(1)
+        log.error("Не удалось подключиться к основной панели 3x-ui: %s", e)
+        return False
+    xui = api
+    primary.api = api
+    log.info("Подключение к 3x-ui успешно (%s).", api.login_debug_info)
+    return True
 
-    for panel in extra_panels:
-        if not api_mode():
-            log.warning("Сервер «%s» пропущен: доп. серверы работают, только если и основной "
-                        "подключён через XUI_API_TOKEN.", panel.name)
-            continue
-        if not panel.env.get("token") or not panel.env.get("sub_base_ok"):
-            log.warning("Сервер «%s» пропущен: нужны XUI_API_TOKEN и XUI_SUB_BASE этого сервера.", panel.name)
+
+async def _connect_extras() -> list:
+    """Подключает доп. серверы из настроек, которые ещё не подключены.
+    Возвращает названия подключённых в этот раз."""
+    connected = []
+    if not XUI_API_TOKEN:
+        return connected
+    for panel in configured_extras():
+        if panel.api is not None:
             continue
         try:
             panel.api = await XUIApi.create(
@@ -2044,10 +2598,82 @@ async def _setup():
                 web_base_path=panel.env["web_base_path"], name=panel.name,
                 inbound_ids=panel.env["inbound_ids"],
             )
+            connected.append(panel.name)
             log.info("Доп. сервер «%s» подключён (%s).", panel.name, panel.api.login_debug_info)
         except XUIError as e:
-            # Не роняем бота: основной сервер работает, сверка догонит позже.
             log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
+    return connected
+
+
+BACKGROUND_LOOPS = {}
+
+
+@tasks.loop(minutes=1)
+async def watchdog():
+    """Раз в минуту: переподключает панели, которые не удалось подключить, и
+    перезапускает остановившиеся фоновые задачи."""
+    try:
+        if xui is None:
+            if await _connect_primary():
+                _checked.clear()
+                await notify_admin(f"✅ Основная панель «{primary.name}» снова доступна.")
+            else:
+                await notify_admin(f"🔴 Основная панель «{primary.name}» недоступна: выдача и отзыв VPN "
+                                   f"не работают. Бот пробует подключиться каждую минуту.",
+                                   key="primary_down", cooldown=3600)
+        missing = [p.name for p in configured_extras() if p.api is None] if XUI_API_TOKEN else []
+        if missing and xui is not None:
+            back = await _connect_extras()
+            if back:
+                _checked.clear()   # досоздать клиентов и довести отложенные удаления
+                await notify_admin("✅ Снова подключены серверы: " + ", ".join(back))
+            still = [n for n in missing if n not in back]
+            if still:
+                await notify_admin("🔴 Не подключены серверы: " + ", ".join(still) + ". Отзыв доступа на них "
+                                   "откладывается до подключения.", key="extras_down", cooldown=3600)
+        for name, loop in BACKGROUND_LOOPS.items():
+            if not loop.is_running():
+                log.error("Фоновая задача %s остановилась - перезапускаю", name)
+                await notify_admin(f"⚠️ Фоновая задача {name} остановилась и перезапущена.", key=f"loop:{name}")
+                loop.start()
+    except Exception:
+        log.exception("Ошибка в watchdog")
+
+
+def _harden_files():
+    """Права 600 на файлы с секретами: .env, базу, лог."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(base, ".env"), db.DB_PATH, db.DB_PATH + "-wal", db.DB_PATH + "-shm",
+                 os.path.join(base, LOG_FILE) if not os.path.isabs(LOG_FILE) else LOG_FILE):
+        try:
+            if os.path.isfile(path):
+                os.chmod(path, 0o600)
+        except OSError as e:
+            log.warning("Не удалось ограничить права на %s: %s", path, e)
+
+
+# ---------- запуск ----------
+
+async def _setup():
+    _harden_files()
+    if XUI_API_TOKEN:
+        log.info("Подключаюсь к панели 3x-ui «%s» через API-токен...", primary.name)
+    else:
+        log.info("Подключаюсь к панели 3x-ui (headless-браузер, может занять 10-20 секунд)...")
+    if await _connect_primary():
+        await _connect_extras()
+    else:
+        # Бот запускается и без панели: поддержка, рассылка и статистика работают,
+        # а подключение повторяется в фоне (watchdog).
+        log.error("Бот запущен без панели. Для диагностики: `python test_connection.py`.")
+    for panel in extra_panels:
+        if panel not in configured_extras():
+            log.warning("Сервер «%s» пропущен: нужны API-токен и адрес подписок этого сервера.", panel.name)
+        elif not XUI_API_TOKEN:
+            log.warning("Сервер «%s» пропущен: доп. серверы работают, только если и основной "
+                        "подключён через XUI_API_TOKEN.", panel.name)
+    if not XUI_VERIFY_SSL:
+        log.warning("XUI_VERIFY_SSL=false: сертификат панели не проверяется, соединение можно перехватить.")
 
     client.add_view(TicketCloseView())  # кнопки «Закрыть обращение» после перезапуска
     client.add_view(SurveyView())       # кнопки опроса после пробного периода
@@ -2056,15 +2682,11 @@ async def _setup():
         global link_server
 
         def _sub_url_for(sub_id: str):
-            # Только действующая подписка: не отключена и срок не вышел
-            # (expiry_ms = 0 - бессрочная).
+            # Страница открывается для любой подписки из базы. Срок здесь не
+            # проверяется: у неначатого пробного периода он ещё не известен, а
+            # истёкшую подписку бот удаляет из базы сам.
             sub = db.get_subscription_by_sub_id(sub_id)
-            if not sub or not sub.get("active"):
-                return None
-            exp = sub.get("expiry_ms") or 0
-            if exp and exp <= int(time.time() * 1000):
-                return None
-            return plain_sub_url(sub_id)
+            return plain_sub_url(sub_id) if sub else None
 
         link_server = LinkServer(_sub_url_for, host=NEXUS_LINK_HOST, port=NEXUS_LINK_PORT,
                                  cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
@@ -2072,7 +2694,7 @@ async def _setup():
         try:
             await link_server.start()
         except Exception as e:
-            # Без переходника бот работает дальше, просто кнопка будет вести в никуда.
+            # Без переходника бот работает дальше, просто кнопки не будет.
             log.error("Не удалось запустить переходник «Добавить в Nexus» на порту %s: %s",
                       NEXUS_LINK_PORT, e)
             await notify_admin(f"⚠️ Переходник «Добавить в Nexus» не запустился: {e}")
@@ -2115,14 +2737,31 @@ async def on_ready():
         return  # on_ready повторяется после переподключений
     _started = True
     _write_ready_marker()
-    if not check_expired.is_running():
-        check_expired.start()
-    if not check_sharing.is_running():
-        check_sharing.start()
-    if SYNC_INTERVAL_MINUTES > 0 and not reconcile_loop.is_running():
-        reconcile_loop.start()  # первый проход - сразу после запуска
-    elif SYNC_INTERVAL_MINUTES <= 0:
+
+    gid = home_guild_id()
+    foreign = [g for g in client.guilds if g.id != gid]
+    if gid is None:
+        log.error("GUILD_ID не задан, а бот состоит в %s серверах: роли не обрабатываются.", len(client.guilds))
+    elif foreign:
+        await notify_admin(
+            "🚨 Бот состоит в посторонних серверах: "
+            + ", ".join(f"«{g.name}» ({g.id})" for g in foreign[:10])
+            + ". Роли и команды там не действуют. Удалите бота оттуда и выключите «Public Bot» в "
+              "Discord Developer Portal → Bot.", key="foreign_guilds", cooldown=24 * 3600)
+
+    BACKGROUND_LOOPS.update({"check_expired": check_expired, "check_sharing": check_sharing,
+                             "revoke_loop": revoke_loop})
+    if SYNC_INTERVAL_MINUTES > 0:
+        BACKGROUND_LOOPS["reconcile_loop"] = reconcile_loop   # первый проход - сразу после запуска
+    else:
         asyncio.create_task(reconcile())  # хотя бы один раз при старте
+    if DB_BACKUP_WEBHOOK_URL:
+        BACKGROUND_LOOPS["db_backup_loop"] = db_backup_loop
+    for loop in BACKGROUND_LOOPS.values():
+        if not loop.is_running():
+            loop.start()
+    if not watchdog.is_running():
+        watchdog.start()
 
 
 def _log_handler() -> logging.Handler:
@@ -2133,7 +2772,16 @@ def _log_handler() -> logging.Handler:
                                backupCount=max(LOG_BACKUPS, 1), encoding="utf-8")
 
 
+def quiet_library_logs():
+    """httpx на уровне INFO пишет полный адрес каждого запроса - с секретным
+    путём панели и subId подписок. В лог идут только предупреждения."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 if __name__ == "__main__":
+    os.umask(0o077)   # лог, база и служебные файлы создаются доступными только владельцу
+    quiet_library_logs()
     client.run(
         DISCORD_TOKEN,
         log_handler=_log_handler(),

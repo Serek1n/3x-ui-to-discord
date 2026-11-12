@@ -46,4 +46,4 @@ chmod 600 "$ARCHIVE"  # внутри .env с паролями
 echo "Снапшот сохранён: $ARCHIVE"
 
 # Оставляем только 10 последних снапшотов, чтобы не забить диск
-ls -1t "$BACKUP_DIR"/xui-discord-bot_*.tar.gz | tail -n +11 | xargs -r rm --
+ls -1t "$BACKUP_DIR"/"${NAME}"_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm --
