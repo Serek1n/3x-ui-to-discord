@@ -154,6 +154,10 @@ STATUS_WEBHOOK_URL = _env("STATUS_WEBHOOK_URL", "")
 # Необязательный вебхук закрытого канала для админов: туда бот пишет об
 # ошибках выдачи/удаления, чтобы о проблеме с оплатившим клиентом узнали сразу.
 ADMIN_LOG_WEBHOOK_URL = _env("ADMIN_LOG_WEBHOOK_URL", "")
+# Куда слать оповещения: dm - в личку администраторам (по умолчанию), channel - в канал
+# по вебхуку, both - туда и туда. ADMIN_DM_IDS - кому в личку (пусто - владельцу бота).
+ADMIN_LOG_MODE = (_env("ADMIN_LOG_MODE", "dm") or "dm").lower()
+ADMIN_DM_IDS = _env_ids("ADMIN_DM_IDS")
 # Как часто сверять роли всех участников с подписками (минуты, 0 = выключить).
 SYNC_INTERVAL_MINUTES = _env_int("SYNC_INTERVAL_MINUTES", "30")
 # Снимать роль VPN Trial после окончания пробного периода (нужно право
@@ -448,13 +452,13 @@ async def send_dm(user, text: str, link: str | None = None):
         log.info("Не удалось написать в ЛС пользователю %s", getattr(user, "id", user))
 
 
-admin_log = AdminLog(ADMIN_LOG_WEBHOOK_URL)
+admin_log = AdminLog(ADMIN_LOG_WEBHOOK_URL, mode=ADMIN_LOG_MODE, dm_ids=ADMIN_DM_IDS)
 admin_log.client = client
 
 
 async def notify_admin(text: str, key: str | None = None, cooldown: int = 6 * 3600, *,
                        title: str | None = None, level: str | None = None, fields=None, who=None):
-    """Карточка в админ-канал (ADMIN_LOG_WEBHOOK_URL), см. admin_log.py.
+    """Карточка администраторам: в личку и/или в канал (ADMIN_LOG_MODE), см. admin_log.py.
     Одинаковые оповещения (по key) - не чаще, чем раз в cooldown секунд;
     однотипные за несколько секунд склеиваются в одну карточку.
     level: error / warn / ok / info / support (иначе - по эмодзи в начале текста).
@@ -2300,7 +2304,7 @@ def _format_stats(stats: Counter) -> str:
     if stats.get("orphans"):
         parts.append(f"Клиентов в панели без записи в базе: {stats['orphans']} (см. `/audit`)")
     if stats.get("errors"):
-        parts.append(f"Ошибок: {stats['errors']} (подробности в админ-канале/логе)")
+        parts.append(f"Ошибок: {stats['errors']} (подробности в оповещениях и bot.log)")
     return "\n".join(parts)
 
 

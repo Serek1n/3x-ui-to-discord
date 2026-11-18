@@ -97,6 +97,97 @@ async def test_guild_id_is_not_mention():
     check("<@" not in sent[0][0].description, "ID сервера превращён в упоминание")
 
 
+# --- доставка в личку ---
+
+class DMUser:
+    def __init__(self, id, closed=False, name="admin"):
+        self.id, self.closed, self.name, self.global_name = id, closed, name, None
+        self.got = []
+
+    async def send(self, embeds=None, allowed_mentions=None):
+        if self.closed:
+            import discord
+            raise discord.Forbidden.__new__(discord.Forbidden)
+        self.got.append(embeds)
+
+
+class App:
+    def __init__(self, owner):
+        self.owner, self.team = owner, None
+
+
+class DMClient:
+    def __init__(self, users, owner=None):
+        self.users = {u.id: u for u in users}
+        self.owner = owner
+
+    def get_user(self, i):
+        return self.users.get(i)
+
+    async def fetch_user(self, i):
+        return self.users[i]
+
+    async def application_info(self):
+        return App(self.owner)
+
+
+class DMLog(AdminLog):
+    hooked = []
+
+    async def _post_webhook(self, embeds):
+        DMLog.hooked.append(embeds)
+
+
+async def test_dm_to_owner_by_default():
+    owner = DMUser(1)
+    lg = DMLog("", mode="dm")
+    lg.client = DMClient([owner], owner=owner)
+    lg.post("🔴 Сбой: подробности")
+    await wait()
+    check(len(owner.got) == 1 and owner.got[0][0].title == "Сбой", "владельцу бота в личку не пришло")
+
+
+async def test_dm_to_listed_admins():
+    a, b, owner = DMUser(10), DMUser(11), DMUser(1)
+    lg = DMLog("", mode="dm", dm_ids=[10, 11])
+    lg.client = DMClient([a, b, owner], owner=owner)
+    lg.post("Событие", title="Т")
+    await wait()
+    check(len(a.got) == 1 and len(b.got) == 1 and not owner.got, "не тем администраторам")
+
+
+async def test_closed_dm_falls_back_to_channel():
+    DMLog.hooked.clear()
+    owner = DMUser(1, closed=True)
+    lg = DMLog("https://example.invalid/hook", mode="dm")
+    lg.client = DMClient([owner], owner=owner)
+    lg.post("Событие", title="Т")
+    await wait()
+    check(len(DMLog.hooked) == 1, "при закрытой личке не ушло в запасной канал")
+
+
+async def test_dm_mode_does_not_duplicate_to_channel():
+    DMLog.hooked.clear()
+    owner = DMUser(1)
+    lg = DMLog("https://example.invalid/hook", mode="dm")
+    lg.client = DMClient([owner], owner=owner)
+    lg.post("Событие", title="Т")
+    await wait()
+    check(len(owner.got) == 1 and not DMLog.hooked, "в режиме dm продублировано в канал")
+
+
+async def test_names_instead_of_mentions():
+    owner = DMUser(1)
+    member = DMUser(123456789012345678, name="kirill")
+    lg = DMLog("", mode="dm")
+    lg.client = DMClient([owner, member], owner=owner)
+    lg.post("Текст", title="Т", who=["123456789012345678", "223456789012345678"])
+    lg.post("Текст", title="Т", who=["223456789012345678"])
+    await wait()
+    d = owner.got[0][0].description
+    check("**kirill**" in d and "<@223456789012345678>" in d, f"имена: {d}")
+
+
 # --- поведение бота ---
 
 bot, db, main_p, milan, admin = load(extras=1)
@@ -136,6 +227,8 @@ async def test_watchdog_reports_state_changes_only():
         await saved.close()
 
 
-run([test_card_has_level_title_and_mention, test_similar_messages_are_merged, test_auto_ids_merged,
+run([test_dm_to_owner_by_default, test_dm_to_listed_admins, test_closed_dm_falls_back_to_channel,
+     test_dm_mode_does_not_duplicate_to_channel, test_names_instead_of_mentions,
+     test_card_has_level_title_and_mention, test_similar_messages_are_merged, test_auto_ids_merged,
      test_many_cards_split_by_ten, test_cooldown_by_key, test_fields_and_long_text, test_guild_id_is_not_mention,
      test_offline_extra_not_reported_per_member, test_watchdog_reports_state_changes_only])

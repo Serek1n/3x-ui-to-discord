@@ -1,4 +1,11 @@
-"""Оповещения в админ-канал Discord (вебхук).
+"""Оповещения администраторам бота.
+
+Куда (ADMIN_LOG_MODE):
+- dm (по умолчанию) - в личные сообщения: людям из ADMIN_DM_IDS, а если список
+  пуст - владельцу бота (или участникам команды) из Discord Developer Portal.
+  Если личка закрыта, сообщение уходит в канал ADMIN_LOG_WEBHOOK_URL (если задан).
+- channel - только в канал по вебхуку ADMIN_LOG_WEBHOOK_URL.
+- both - и туда, и туда.
 
 - Каждое оповещение - карточка (embed) с цветной полосой по важности:
   красная - сбой, оранжевая - предупреждение, зелёная - восстановлено,
@@ -55,9 +62,6 @@ class Item:
         return self.level, self.title, _ID.sub("#", self.text)
 
 
-def _mention(text: str) -> str:
-    """discord_123... -> <@123...>: в карточке показывается имя, без пинга."""
-    return _ID.sub(lambda m: f"<@{m.group(1)}>", text)
 
 
 def _strip_ids(text: str) -> str:
@@ -73,13 +77,55 @@ def _short(text: str, limit: int) -> str:
 
 
 class AdminLog:
-    def __init__(self, url: str, username: str = "NEXUS_VPN Logs"):
+    def __init__(self, url: str = "", username: str = "NEXUS_VPN Logs", *, mode: str = "dm", dm_ids=()):
         self.url = url
         self.username = username
+        self.mode = mode if mode in ("dm", "channel", "both") else "dm"
+        self.dm_ids = [int(i) for i in dm_ids]
         self.client = None          # discord.Client - задаётся ботом
         self._queue: list = []
         self._task = None
         self._last: dict = {}
+        self._recipients = None     # кэш: кому писать в личку
+        self._dm_failed: set = set()
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "channel" or bool(self.url)
+
+    def name(self, uid: str) -> str:
+        """Имя участника вместо упоминания: в личке упоминания незнакомых
+        клиенту Discord людей показываются как «@unknown-user»."""
+        user = self.client.get_user(int(uid)) if self.client is not None else None
+        if user is None:
+            return f"<@{uid}>"
+        return f"**{discord.utils.escape_markdown(user.global_name or user.name)}**"
+
+    def _names(self, text: str) -> str:
+        return _ID.sub(lambda m: self.name(m.group(1)), text)
+
+    async def recipients(self) -> list:
+        """Кому писать в личку: ADMIN_DM_IDS или владелец бота / команда из Developer Portal."""
+        if self._recipients is not None:
+            return self._recipients
+        ids = list(self.dm_ids)
+        if not ids and self.client is not None:
+            app = await self.client.application_info()
+            if app.team:
+                ids = [m.id for m in app.team.members
+                       if getattr(m, "membership_state", None) == discord.TeamMembershipState.accepted]
+            elif app.owner:
+                ids = [app.owner.id]
+        users = []
+        for uid in ids:
+            try:
+                users.append(self.client.get_user(uid) or await self.client.fetch_user(uid))
+            except discord.HTTPException as e:
+                log.error("Администратор %s для оповещений не найден: %s", uid, e)
+        self._recipients = users
+        if not users:
+            log.error("Некому отправлять оповещения в личку: задайте ADMIN_DM_IDS в .env")
+        return users
 
     def post(self, text: str, *, key=None, cooldown: int = 6 * 3600, title=None, level=None,
              fields=None, who=None) -> bool:
@@ -98,7 +144,7 @@ class AdminLog:
             title, text = self._split_title(text)
         ids = [str(w) for w in (who or [])] or list(dict.fromkeys(_ID.findall(text)))
         self._queue.append(Item(level, title, text.strip(), list(fields or []), ids))
-        if not self.url:
+        if not self.enabled:
             self._queue.clear()
             return True
         if self._task is None or self._task.done():
@@ -148,12 +194,12 @@ class AdminLog:
         if n > 1:
             title = f"{title} ×{n}"
         if n == 1:
-            desc = _mention(first.text)
+            desc = self._names(first.text)
         else:
             who = list(dict.fromkeys(w for it in group for w in it.who))
             desc = _strip_ids(first.text)
             if who:
-                shown = ", ".join(f"<@{w}>" for w in who[:15])
+                shown = ", ".join(self.name(w) for w in who[:15])
                 more = f" и ещё {len(who) - 15}" if len(who) > 15 else ""
                 desc = (desc + "\n\n" if desc else "") + f"**Кого касается ({len(who)}):** {shown}{more}"
         emb = discord.Embed(title=_short(title, 250), description=_short(desc, MAX_DESC) or None, color=color,
@@ -177,6 +223,29 @@ class AdminLog:
             await self._post(batch)
 
     async def _post(self, embeds: list):
+        dm_ok = True
+        if self.mode in ("dm", "both"):
+            dm_ok = await self._post_dm(embeds)
+        if self.url and (self.mode in ("channel", "both") or not dm_ok):
+            await self._post_webhook(embeds)
+
+    async def _post_dm(self, embeds: list) -> bool:
+        """В личку каждому администратору. False - никому не дошло."""
+        if self.client is None:
+            return False
+        delivered = False
+        for user in await self.recipients():
+            try:
+                await user.send(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+                delivered = True
+                self._dm_failed.discard(user.id)
+            except discord.HTTPException as e:
+                if user.id not in self._dm_failed:   # не засоряем лог каждой карточкой
+                    self._dm_failed.add(user.id)
+                    log.error("Не удалось написать администратору %s в личку (закрыты ЛС?): %s", user.id, e)
+        return delivered
+
+    async def _post_webhook(self, embeds: list):
         webhook = discord.Webhook.from_url(self.url, client=self.client)
         await webhook.send(embeds=embeds, username=self.username, allowed_mentions=discord.AllowedMentions.none())
 
@@ -184,7 +253,7 @@ class AdminLog:
         """Отправить всё, что в очереди (при остановке бота)."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
-        if self._queue and self.url:
+        if self._queue and self.enabled:
             items, self._queue = self._queue, []
             try:
                 await self._send(self._build(items))
