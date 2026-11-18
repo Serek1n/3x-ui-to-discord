@@ -62,6 +62,7 @@ from xui_client import XUIClient, XUIError  # noqa: E402
 from xui_api import XUIApi, recent_ips  # noqa: E402
 import rf_check  # noqa: E402
 from link_server import LinkServer  # noqa: E402
+from admin_log import AdminLog  # noqa: E402
 
 log = logging.getLogger("nexus")
 
@@ -284,6 +285,7 @@ class VPNBot(discord.Client):
         await _setup()
 
     async def close(self):
+        await admin_log.drain()
         if link_server is not None:
             await link_server.stop()
         if xui is not None:
@@ -446,26 +448,19 @@ async def send_dm(user, text: str, link: str | None = None):
         log.info("Не удалось написать в ЛС пользователю %s", getattr(user, "id", user))
 
 
-_last_alerts: dict = {}
+admin_log = AdminLog(ADMIN_LOG_WEBHOOK_URL)
+admin_log.client = client
 
 
-async def notify_admin(text: str, key: str | None = None, cooldown: int = 6 * 3600):
-    """Сообщение в админ-канал через ADMIN_LOG_WEBHOOK_URL. Одинаковые
-    оповещения (по key) не чаще, чем раз в cooldown секунд."""
-    log.warning("ADMIN: %s", text)
-    if not ADMIN_LOG_WEBHOOK_URL:
-        return
-    if key:
-        now = time.time()
-        if now - _last_alerts.get(key, 0) < cooldown:
-            return
-        _last_alerts[key] = now
-    try:
-        webhook = discord.Webhook.from_url(ADMIN_LOG_WEBHOOK_URL, client=client)
-        await webhook.send(text[:1900], username="NEXUS_VPN Logs",
-                           allowed_mentions=discord.AllowedMentions.none())
-    except Exception as e:
-        log.error("Не удалось отправить оповещение админам: %s", e)
+async def notify_admin(text: str, key: str | None = None, cooldown: int = 6 * 3600, *,
+                       title: str | None = None, level: str | None = None, fields=None, who=None):
+    """Карточка в админ-канал (ADMIN_LOG_WEBHOOK_URL), см. admin_log.py.
+    Одинаковые оповещения (по key) - не чаще, чем раз в cooldown секунд;
+    однотипные за несколько секунд склеиваются в одну карточку.
+    level: error / warn / ok / info / support (иначе - по эмодзи в начале текста).
+    who: Discord ID участников, которых касается сообщение."""
+    if admin_log.post(text, key=key, cooldown=cooldown, title=title, level=level, fields=fields, who=who):
+        log.warning("ADMIN: %s%s", f"{title}: " if title else "", text)
 
 
 _member_locks: dict = {}
@@ -521,8 +516,8 @@ async def _create_on_extras(email: str, expiry_time: int, comment: str):
             subs[panel.name] = f"{panel.sub_base}/{created['subId']}"
         except XUIError as e:
             failed.append(panel.name)
-            await notify_admin(f"⚠️ Не удалось создать клиента {email} на сервере «{panel.name}»: {e}",
-                               key=f"extra:{panel.name}:{email}")
+            await notify_admin(f"Причина: {e}", key=f"extra:{panel.name}:{email}", level="warn",
+                               title=f"Клиент не создан на сервере «{panel.name}»", who=[email[8:]])
     return subs, failed
 
 
@@ -541,8 +536,8 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
             await _link_extras(email, created["subId"], extra_subs)
         except XUIError as e:
             failed.append("внешние ссылки")
-            await notify_admin(f"⚠️ Не удалось прописать доп. серверы в подписку {email}: {e}",
-                               key=f"links:{email}")
+            await notify_admin(f"Причина: {e}", key=f"links:{email}", level="warn",
+                               title="Доп. серверы не добавлены в подписку", who=[email[8:]])
     else:
         days = TRIAL_DAYS if kind == "trial" else 0
         created = await xui.add_client(XUI_INBOUND_ID, email, days, ip_limit=DEVICE_LIMIT)
@@ -576,8 +571,9 @@ async def _verify_browser_client(email: str, kind: str):
     if DEVICE_LIMIT and "limitIp" in found and int(found.get("limitIp") or 0) != DEVICE_LIMIT:
         problems.append(f"лимит устройств {found.get('limitIp')} вместо {DEVICE_LIMIT}")
     if problems:
-        await notify_admin(f"⚠️ Клиент {email} создан через браузер с отклонениями: "
-                           + ", ".join(problems) + ". Проверьте его в панели.", key=f"browser:{email}")
+        await notify_admin(", ".join(problems).capitalize() + ". Проверьте клиента в панели.",
+                           key=f"browser:{email}", level="warn", title="Клиент создан с отклонениями",
+                           who=[email[8:]])
 
 
 def _sub_source(sub: dict) -> str:
@@ -696,7 +692,11 @@ async def ensure_extras(sub: dict):
     if set(wanted.values()) - linked:
         await _link_extras(email, sub["sub_id"], wanted)
     if missing:
-        raise XUIError("не подключены серверы: " + ", ".join(missing))
+        raise ExtrasOffline("не подключены серверы: " + ", ".join(missing))
+
+
+class ExtrasOffline(XUIError):
+    """Часть доп. серверов не подключена - проверка отложена до подключения."""
 
 
 async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
@@ -710,13 +710,14 @@ async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
     if found is None:
         if sub["kind"] != "paid":
             # Пробную не пересоздаём (это был бы новый срок): её уберёт check_expired.
-            await notify_admin(f"⚠️ Пробного клиента {sub['email']} нет в панели, а в базе бота он есть.",
-                               key=f"drift:{did}", cooldown=24 * 3600)
+            await notify_admin("Пробного клиента нет в панели, а в базе бота он есть.", level="warn",
+                               title="Расхождение с панелью", key=f"drift:{did}", cooldown=24 * 3600,
+                               who=[did])
             _checked[did] = time.time()
             return False
         link = await _create_sub(did, "paid", member=member, source=_sub_source(sub))
-        await notify_admin(f"🛠 Клиент {sub['email']} пропал из панели и создан заново, "
-                           f"пользователю отправлена новая ссылка.")
+        await notify_admin("Клиент пропал из панели и создан заново, человеку отправлена новая ссылка.",
+                           level="ok", title="Подписка восстановлена", who=[did])
         if member is not None:
             await send_dm(member, "Ваша VPN-подписка была восстановлена после сбоя. Старая ссылка больше не "
                                   f"работает, добавьте новую:\n{link}", link)
@@ -736,8 +737,12 @@ async def _ensure_quiet(member, sub: dict, actions: list):
     try:
         if await ensure_consistent(member, sub):
             actions.append("restored")
+    except ExtrasOffline:
+        # Об отключённом сервере сообщает watchdog - одной карточкой, а не по каждому человеку.
+        pass
     except XUIError as e:
-        await notify_admin(f"⚠️ Сверка с панелью для {sub['email']}: {e}", key=f"ensure:{sub['discord_id']}")
+        await notify_admin(f"{e}", key=f"ensure:{sub['discord_id']}", level="warn",
+                           title="Сверка с панелью", who=[sub["discord_id"]])
 
 
 async def reissue_link(discord_id: str):
@@ -783,7 +788,8 @@ async def reissue_link(discord_id: str):
         await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
     except XUIError as e:
         failed.append("внешние ссылки")
-        await notify_admin(f"⚠️ Перевыпуск {email}: не удалось прописать доп. серверы: {e}")
+        await notify_admin(f"Причина: {e}", level="warn", title="Перевыпуск: доп. серверы не добавлены",
+                           who=[email[8:]])
     # Сервер, где ключи не заменились, остаётся непроверенным: сверка пересоздаст
     # там клиента, потому что он не привязан к новой подписке.
     if failed:
@@ -841,11 +847,11 @@ async def _revoke(sub: dict, reason: str, user=None, dm_text: str = "") -> str:
             db.set_revoke(did, now, reason)
         pending = len(db.list_pending_revokes(due_before=now))
         await notify_admin(
-            f"🛑 За последний час бот отозвал уже {len(_revoke_log)} подписок, это больше обычного "
-            f"(лимит {_revoke_limit()}). Ещё {pending} ждут удаления и НЕ удаляются, пока вы не проверите "
-            f"роли на сервере. Если всё верно, выполните `/sync confirm:True`. Если роли сняты по ошибке, "
-            f"верните их: удаление отменится само.",
-            key="revoke_hold", cooldown=3600,
+            "Удалений больше обычного - остальные ждут вашей проверки.\n"
+            "• Роли сняты по ошибке - верните их, удаление отменится само.\n"
+            "• Всё верно - выполните `/sync confirm:True`.",
+            title="Удаления приостановлены", level="error", key="revoke_hold", cooldown=3600,
+            fields=[("Отозвано за час", len(_revoke_log)), ("Лимит", _revoke_limit()), ("Ждут", pending)],
         )
         return "held"
     try:
@@ -884,11 +890,13 @@ async def process_due_revokes() -> Counter:
                 stats["revoked" if result == "deleted" else result] += 1
         except XUIError as e:
             stats["errors"] += 1
-            await notify_admin(f"⚠️ Не удалось отозвать доступ {did}: {e}", key=f"revoke:{did}")
+            await notify_admin(f"{e}. Бот повторит попытку.", key=f"revoke:{did}", level="warn",
+                               title="Доступ пока не отозван", who=[did])
         except Exception as e:
             stats["errors"] += 1
             log.exception("Ошибка отзыва доступа %s", did)
-            await notify_admin(f"⚠️ Ошибка отзыва доступа {did}: {e!r}", key=f"revoke:{did}")
+            await notify_admin(f"{e!r}", key=f"revoke:{did}", level="error", title="Ошибка отзыва доступа",
+                               who=[did])
     if _revoke_hold and not db.list_pending_revokes(due_before=time.time()):
         _revoke_hold = False   # ждать больше нечего: роли вернули или всё удалено
     return stats
@@ -978,8 +986,9 @@ async def sync_member(member, *, trial_just_added: bool = False, quiet: bool = F
                     await send_dm(member, f"Пробный период доступен аккаунтам Discord старше "
                                           f"{TRIAL_MIN_ACCOUNT_AGE_DAYS} {_plural_days(TRIAL_MIN_ACCOUNT_AGE_DAYS)}. "
                                           f"Напишите в /support, если это ошибка.")
-                    await notify_admin(f"ℹ️ {member} ({member.id}) не получил trial: аккаунту {age_days} дн.",
-                                       key=f"age:{member.id}", cooldown=24 * 3600)
+                    await notify_admin(f"Аккаунту Discord {age_days} дн., нужно не меньше "
+                                       f"{TRIAL_MIN_ACCOUNT_AGE_DAYS}.", title="Пробный период не выдан",
+                                       key=f"age:{member.id}", cooldown=24 * 3600, who=[member.id])
                 return actions
             link = await _create_sub(discord_id, "trial", member=member, source="trial")
             # Помечаем использованным только после успешной выдачи.
@@ -1018,17 +1027,15 @@ async def _safe_sync(member, **kwargs):
     try:
         return await sync_member(member, **kwargs)
     except XUIError as e:
-        await notify_admin(
-            f"⚠️ Не удалось синхронизировать VPN для {member} ({member.id}): {e}",
-            key=f"sync:{member.id}",
-        )
+        await notify_admin(f"{e}", key=f"sync:{member.id}", level="warn",
+                           title="VPN не синхронизирован с ролью", who=[member.id])
         if not kwargs.get("quiet"):
             await send_dm(member, "Не получилось обновить ваш VPN-доступ из-за ошибки панели. "
                                   "Бот повторит попытку автоматически, администратор уже уведомлён.")
     except Exception as e:
         log.exception("Ошибка sync_member для %s", member.id)
-        await notify_admin(f"⚠️ Ошибка при обработке {member} ({member.id}): {e!r}",
-                           key=f"sync:{member.id}")
+        await notify_admin(f"{e!r}", key=f"sync:{member.id}", level="error", title="Ошибка обработки ролей",
+                           who=[member.id])
     return []
 
 
@@ -1104,15 +1111,17 @@ class ConfirmReissueView(discord.ui.View):
         if failed:
             text += ("\n\n⚠️ Серверы " + ", ".join(failed) + " сейчас недоступны - они появятся в подписке "
                      "автоматически, когда снова заработают (обновите подписку в приложении позже).")
-            await notify_admin(f"⚠️ Перевыпуск для {discord_id}: не созданы клиенты на " + ", ".join(failed),
-                               key=f"reissue:{discord_id}")
+            await notify_admin("Ключи заменятся автоматически, когда серверы снова будут доступны: "
+                               + ", ".join(failed), key=f"reissue:{discord_id}", level="warn",
+                               title="Перевыпуск: не все серверы", who=[discord_id])
         view = nexus_view(link)
         if view is not None:
             await interaction.followup.send(text, file=make_qr_file(link), view=view, ephemeral=True)
         else:
             await interaction.followup.send(text, file=make_qr_file(link), ephemeral=True)
         await send_dm(interaction.user, text, link)
-        await notify_admin(f"🔁 {interaction.user} ({discord_id}) перевыпустил ссылку подписки")
+        await notify_admin("Старая ссылка и ключи больше не работают.", title="Ссылка перевыпущена",
+                           who=[discord_id])
 
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1665,12 +1674,13 @@ async def status_server_cmd(interaction: discord.Interaction):
 
     for sv in servers:
         if sv["xray"] is False:
-            await notify_admin(f"🔴 /status_server: Xray на сервере «{sv['name']}» не запущен!",
-                               key=f"xray_down:{sv['name']}", cooldown=600)
+            await notify_admin("VPN на этом сервере не работает, проверьте панель.", level="error",
+                               title=f"Xray не запущен: {sv['name']}", key=f"xray_down:{sv['name']}",
+                               cooldown=600)
         rf = sv.get("rf")
         if rf is not None and rf.status == "blocked":
-            await notify_admin(f"🚫 /status_server: сервер «{sv['name']}» недоступен из РФ "
-                               f"(0/{rf.total} узлов check-host.net)",
+            await notify_admin(f"Ни один из {rf.total} узлов check-host.net в России не подключился.",
+                               level="error", title=f"Недоступен из РФ: {sv['name']}",
                                key=f"rf_blocked:{sv['name']}", cooldown=3600)
 
 
@@ -1726,7 +1736,8 @@ async def sync_cmd(interaction: discord.Interaction, confirm: bool = False):
         # Админ подтвердил: следующие 10 минут удаления идут без лимита.
         _revoke_hold = False
         _revoke_approved_until = time.time() + 600
-        await notify_admin(f"✅ {interaction.user} подтвердил отложенные удаления (`/sync confirm:True`).")
+        await notify_admin("Отложенные удаления выполняются.", level="ok", title="Удаления подтверждены",
+                           who=[interaction.user.id])
     stats = await reconcile(force_check=True)
     await interaction.followup.send(_format_stats(stats), ephemeral=True)
 
@@ -1851,7 +1862,8 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
                             errors.append(f"{name}/{email}: {e}")
                 lines.append(f"🗑 Удалено клиентов без записи: {removed}" +
                              (f". Ошибки: {'; '.join(errors[:5])}" if errors else ""))
-                await notify_admin(f"🗑 {interaction.user} удалил {removed} клиентов без записи в базе (`/audit`).")
+                await notify_admin(f"Удалено клиентов без записи в базе: {removed}.", title="Очистка панелей",
+                                   who=[interaction.user.id])
             else:
                 lines.append("Удалить их: `/audit delete_orphans:True`.")
         else:
@@ -1873,8 +1885,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     original = getattr(error, "original", error)
     log.error("Ошибка команды /%s: %r", interaction.command.name if interaction.command else "?",
               original, exc_info=original)
-    await notify_admin(f"⚠️ Ошибка в команде /{interaction.command.name if interaction.command else '?'} "
-                       f"от {interaction.user}: {original!r}")
+    await notify_admin(f"{original!r}", level="error", who=[interaction.user.id],
+                       title=f"Ошибка в команде /{interaction.command.name if interaction.command else '?'}")
     text = "Произошла ошибка, администратор уведомлён. Попробуйте позже."
     try:
         if interaction.response.is_done():
@@ -1898,10 +1910,10 @@ SURVEY_REASONS = {
 
 async def _save_survey(interaction: discord.Interaction, reason: str, comment: str = ""):
     db.save_survey(str(interaction.user.id), reason, comment)
-    text = f"🗳 Опрос после trial: {interaction.user} ({interaction.user.id}) — {SURVEY_REASONS[reason]}"
+    text = f"**{SURVEY_REASONS[reason]}**"
     if comment:
-        text += f": «{comment[:500]}»"
-    await notify_admin(text)
+        text += f"\n«{comment[:500]}»"
+    await notify_admin(text, title="Ответ на опрос после пробного периода", who=[interaction.user.id])
     log.info("Ответ на опрос от %s: %s", interaction.user.id, reason)
 
 
@@ -2057,12 +2069,13 @@ async def support_cmd(interaction: discord.Interaction, topic: str = ""):
         await interaction.followup.send(
             "Не получилось открыть обращение (у бота нет прав на приватные ветки?). "
             "Напишите администратору напрямую.", ephemeral=True)
-        await notify_admin(f"⚠️ /support: не удалось создать ветку для {interaction.user}: {e}")
+        await notify_admin(f"{e}", level="error", title="Поддержка: ветка не создана", who=[interaction.user.id])
         return
 
     db.create_ticket(discord_id, thread.id, topic)
     await interaction.followup.send(f"Обращение открыто: {thread.mention}", ephemeral=True)
-    await notify_admin(f"🆘 Новое обращение от {interaction.user} ({discord_id}): {topic or 'без темы'}")
+    await notify_admin(f"{topic or 'Без темы'}\n{thread.mention}", level="support", title="Новое обращение",
+                       who=[discord_id])
 
 
 # ---------- рассылка ----------
@@ -2106,7 +2119,7 @@ class AnnounceConfirmView(discord.ui.View):
             await interaction.followup.send(result, ephemeral=True)
         except discord.HTTPException:
             pass
-        await notify_admin(f"📢 Рассылка от {interaction.user}: {result}")
+        await notify_admin(f"{result}", title="Рассылка", who=[interaction.user.id])
 
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2206,10 +2219,11 @@ async def check_sharing():
         if len(recent) > SHARING_IP_THRESHOLD:
             ips = ", ".join(sorted(recent)[:15])
             await notify_admin(
-                f"👥 Возможная передача подписки: <@{sub['discord_id']}> (`{sub['email']}`) - "
-                f"{len(recent)} разных IP за сутки (порог {SHARING_IP_THRESHOLD}, лимит устройств "
-                f"{DEVICE_LIMIT}): {ips}. Подробнее: `/ips`.",
+                "Подробнее: `/ips`. Смена Wi-Fi и мобильной сети тоже даёт новые IP.",
+                title="Возможная передача подписки", level="warn", who=[sub["discord_id"]],
                 key=f"sharing:{sub['discord_id']}", cooldown=24 * 3600,
+                fields=[("IP за сутки", f"{len(recent)} (порог {SHARING_IP_THRESHOLD})"),
+                        ("Лимит устройств", DEVICE_LIMIT), ("Адреса", ips, False)],
             )
         await asyncio.sleep(0.2)
 
@@ -2248,17 +2262,17 @@ async def on_member_remove(member: discord.Member):
         try:
             await _revoke(sub, "left", member, "Вы покинули сервер, поэтому доступ к VPN отозван.")
         except XUIError as e:
-            await notify_admin(f"⚠️ {member} ({member.id}) вышел с сервера, но удалить VPN не удалось: {e}",
-                               key=f"leave:{member.id}")
+            await notify_admin(f"{e}. Бот повторит попытку.", key=f"leave:{member.id}", level="warn",
+                               title="Вышел с сервера, VPN пока не удалён", who=[member.id])
 
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
     if not _is_home(guild):
         await notify_admin(
-            f"🚨 Бота добавили на посторонний сервер «{guild.name}» ({guild.id}). Роли и команды там не "
-            f"действуют. Если это не вы, удалите бота с этого сервера и выключите «Public Bot» в "
-            f"Discord Developer Portal → Bot.")
+            f"«{guild.name}» (`{guild.id}`). Роли и команды там не действуют. Если это не вы - удалите "
+            f"бота оттуда и выключите «Public Bot» в Developer Portal → Bot.",
+            title="Бота добавили на чужой сервер", level="error")
 
 
 # ---------- сверка ролей и подписок ----------
@@ -2288,6 +2302,16 @@ def _format_stats(stats: Counter) -> str:
     if stats.get("errors"):
         parts.append(f"Ошибок: {stats['errors']} (подробности в админ-канале/логе)")
     return "\n".join(parts)
+
+
+_STAT_LABELS = (("granted", "Выдано"), ("upgraded", "Trial → платная"), ("trial", "Пробных"),
+                ("revoked", "Отозвано"), ("restored", "Восстановлено"), ("scheduled", "Ждут отсрочки"),
+                ("held", "Ждут подтверждения"), ("orphans", "Без записи в базе"), ("errors", "Ошибок"))
+
+
+def _stats_fields(stats: Counter) -> list:
+    """Ненулевые итоги сверки - полями карточки."""
+    return [(label, stats[k]) for k, label in _STAT_LABELS if stats.get(k)]
 
 
 def _skip(stats: Counter, reason: str) -> Counter:
@@ -2359,7 +2383,7 @@ async def reconcile(force_check: bool = False) -> Counter:
                     stats[action] += 1
             except Exception as e:
                 stats["errors"] += 1
-                await notify_admin(f"⚠️ Сверка: ошибка для {members[did]} ({did}): {e}", key=f"sync:{did}")
+                await notify_admin(f"{e}", key=f"sync:{did}", level="warn", title="Сверка: ошибка", who=[did])
 
         # Участника нет на сервере. Только если список участников загружен полностью.
         if all_chunked:
@@ -2375,8 +2399,8 @@ async def reconcile(force_check: bool = False) -> Counter:
                         stats["revoked" if result == "deleted" else result] += 1
                     except Exception as e:
                         stats["errors"] += 1
-                        await notify_admin(f"⚠️ Сверка: не удалось удалить подписку ушедшего {did}: {e}",
-                                           key=f"sync:{did}")
+                        await notify_admin(f"{e}. Бот повторит попытку.", key=f"sync:{did}", level="warn",
+                                           title="Ушедший: VPN пока не удалён", who=[did])
 
         if api_mode() and (force_check or time.time() - _last_orphan_check > CHECK_TTL):
             try:
@@ -2386,9 +2410,9 @@ async def reconcile(force_check: bool = False) -> Counter:
                 if total:
                     stats["orphans"] = total
                     await notify_admin(
-                        f"🔎 В панелях есть {total} клиентов бота без записи в базе (они работают, но бот ими "
-                        f"не управляет): " + "; ".join(f"{k}: {', '.join(v[:10])}" for k, v in orphans.items())
-                        + ". Посмотреть и удалить: `/audit`.", key="orphans", cooldown=24 * 3600)
+                        "Эти клиенты работают, но бот ими не управляет. Посмотреть и удалить: `/audit`.",
+                        title="Клиенты без записи в базе", level="warn", key="orphans", cooldown=24 * 3600,
+                        fields=[(k, f"{len(v)} шт.") for k, v in orphans.items()])
             except XUIError as e:
                 log.warning("Поиск клиентов без записи в базе: %s", e)
 
@@ -2404,7 +2428,8 @@ async def reconcile(force_check: bool = False) -> Counter:
     changed = sum(stats.get(k, 0) for k in ("granted", "upgraded", "trial", "revoked", "restored"))
     log.info("Сверка завершена: %s", dict(stats))
     if changed or stats.get("errors"):
-        await notify_admin("🔄 Сверка ролей:\n" + _format_stats(stats))
+        await notify_admin(f"Проверено участников: {stats.get('checked', 0)}", title="Сверка ролей",
+                           level="warn" if stats.get("errors") else "info", fields=_stats_fields(stats))
     return stats
 
 
@@ -2479,8 +2504,8 @@ async def _expire_one(discord_id: str, now_ms: int):
         try:
             await _delete_sub(sub, reason="trial_expired")
         except XUIError as e:
-            await notify_admin(f"⚠️ Не удалось удалить истёкшую подписку {discord_id}: {e}",
-                               key=f"expire:{discord_id}")
+            await notify_admin(f"{e}. Бот повторит попытку через час.", key=f"expire:{discord_id}",
+                               level="warn", title="Пробный период: клиент не удалён", who=[discord_id])
             return
 
         member = find_member(int(discord_id))
@@ -2525,8 +2550,8 @@ async def check_expired():
                 await _expire_one(sub["discord_id"], now_ms)
             except Exception as e:
                 log.exception("Ошибка проверки срока подписки %s", sub["discord_id"])
-                await notify_admin(f"⚠️ Ошибка проверки срока {sub['discord_id']}: {e!r}",
-                                   key=f"expire_err:{sub['discord_id']}")
+                await notify_admin(f"{e!r}", key=f"expire_err:{sub['discord_id']}", level="error",
+                                   title="Ошибка проверки срока", who=[sub["discord_id"]])
     except Exception:
         log.exception("Ошибка в check_expired")
 
@@ -2550,7 +2575,7 @@ async def db_backup_loop():
                            username="NEXUS_VPN Backup", allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         log.exception("Не удалось отправить копию базы")
-        await notify_admin(f"⚠️ Не удалось отправить копию базы: {e!r}", key="db_backup")
+        await notify_admin(f"{e!r}", key="db_backup", level="warn", title="Копия базы не отправлена")
     finally:
         try:
             os.remove(tmp)
@@ -2576,6 +2601,7 @@ async def _connect_primary() -> bool:
             )
     except XUIError as e:
         log.error("Не удалось подключиться к основной панели 3x-ui: %s", e)
+        _last_error[primary.name] = str(e)
         return False
     xui = api
     primary.api = api
@@ -2602,10 +2628,52 @@ async def _connect_extras() -> list:
             log.info("Доп. сервер «%s» подключён (%s).", panel.name, panel.api.login_debug_info)
         except XUIError as e:
             log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
+            _last_error[panel.name] = str(e)
     return connected
 
 
 BACKGROUND_LOOPS = {}
+
+
+_down_since: dict = {}     # сервер -> когда перестал отвечать
+_down_reminded: dict = {}  # сервер -> когда последний раз напоминали
+_last_error: dict = {}     # сервер -> текст последней ошибки подключения
+DOWN_REMIND_SEC = 6 * 3600
+
+
+def _ago(seconds: float) -> str:
+    m = int(seconds // 60)
+    if m < 60:
+        return f"{max(m, 1)} мин."
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин." if h < 24 else f"{h // 24} дн. {h % 24} ч"
+
+
+async def _panel_state(name: str, ok: bool, what: str):
+    """Сообщает о сервере только при смене состояния (и напоминает раз в 6 часов)."""
+    now = time.time()
+    if ok:
+        since = _down_since.pop(name, None)
+        _down_reminded.pop(name, None)
+        if since is not None:
+            await notify_admin(f"Не был доступен {_ago(now - since)}. Отложенные действия выполняются.",
+                               title=f"Сервер снова работает: {name}", level="ok")
+        return
+    if name not in _down_since:
+        _down_since[name] = now
+    elif now - _down_reminded.get(name, 0) < DOWN_REMIND_SEC:
+        return
+    first = name not in _down_reminded
+    _down_reminded[name] = now
+    reason = _last_error.get(name) or "нет ответа"
+    text = what if first else f"Всё ещё не подключён ({_ago(now - _down_since[name])})."
+    await notify_admin(f"{text}\nБот пробует подключиться каждую минуту.",
+                       title=f"Сервер не подключён: {name}", level="error",
+                       fields=[("Причина", _short_err(reason), False)])
+
+
+def _short_err(text: str) -> str:
+    return text if len(text) <= 300 else text[:299] + "…"
 
 
 @tasks.loop(minutes=1)
@@ -2614,27 +2682,25 @@ async def watchdog():
     перезапускает остановившиеся фоновые задачи."""
     try:
         if xui is None:
-            if await _connect_primary():
+            ok = await _connect_primary()
+            if ok:
                 _checked.clear()
-                await notify_admin(f"✅ Основная панель «{primary.name}» снова доступна.")
-            else:
-                await notify_admin(f"🔴 Основная панель «{primary.name}» недоступна: выдача и отзыв VPN "
-                                   f"не работают. Бот пробует подключиться каждую минуту.",
-                                   key="primary_down", cooldown=3600)
-        missing = [p.name for p in configured_extras() if p.api is None] if XUI_API_TOKEN else []
-        if missing and xui is not None:
-            back = await _connect_extras()
-            if back:
-                _checked.clear()   # досоздать клиентов и довести отложенные удаления
-                await notify_admin("✅ Снова подключены серверы: " + ", ".join(back))
-            still = [n for n in missing if n not in back]
-            if still:
-                await notify_admin("🔴 Не подключены серверы: " + ", ".join(still) + ". Отзыв доступа на них "
-                                   "откладывается до подключения.", key="extras_down", cooldown=3600)
+            await _panel_state(primary.name, ok, "Основная панель недоступна: выдача и отзыв VPN не работают.")
+        else:
+            await _panel_state(primary.name, True, "")
+        if XUI_API_TOKEN and xui is not None:
+            if any(p.api is None for p in configured_extras()):
+                if await _connect_extras():
+                    _checked.clear()   # досоздать клиентов и довести отложенные удаления
+            for p in configured_extras():
+                await _panel_state(p.name, p.api is not None,
+                                   "Новые подписки создаются без этого сервера, отзыв доступа на нём "
+                                   "откладывается до подключения.")
         for name, loop in BACKGROUND_LOOPS.items():
             if not loop.is_running():
                 log.error("Фоновая задача %s остановилась - перезапускаю", name)
-                await notify_admin(f"⚠️ Фоновая задача {name} остановилась и перезапущена.", key=f"loop:{name}")
+                await notify_admin(f"Задача `{name}` остановилась из-за ошибки и запущена снова.", level="warn",
+                                   title="Фоновая задача перезапущена", key=f"loop:{name}")
                 loop.start()
     except Exception:
         log.exception("Ошибка в watchdog")
@@ -2697,7 +2763,7 @@ async def _setup():
             # Без переходника бот работает дальше, просто кнопки не будет.
             log.error("Не удалось запустить переходник «Добавить в Nexus» на порту %s: %s",
                       NEXUS_LINK_PORT, e)
-            await notify_admin(f"⚠️ Переходник «Добавить в Nexus» не запустился: {e}")
+            await notify_admin(f"{e}", level="error", title="Кнопка «Добавить в Nexus» не работает")
             link_server = None
 
     if TEST_GUILD_ID:
@@ -2744,10 +2810,10 @@ async def on_ready():
         log.error("GUILD_ID не задан, а бот состоит в %s серверах: роли не обрабатываются.", len(client.guilds))
     elif foreign:
         await notify_admin(
-            "🚨 Бот состоит в посторонних серверах: "
-            + ", ".join(f"«{g.name}» ({g.id})" for g in foreign[:10])
+            ", ".join(f"«{g.name}» (`{g.id}`)" for g in foreign[:10])
             + ". Роли и команды там не действуют. Удалите бота оттуда и выключите «Public Bot» в "
-              "Discord Developer Portal → Bot.", key="foreign_guilds", cooldown=24 * 3600)
+              "Developer Portal → Bot.", title="Бот на чужих серверах", level="error",
+            key="foreign_guilds", cooldown=24 * 3600)
 
     BACKGROUND_LOOPS.update({"check_expired": check_expired, "check_sharing": check_sharing,
                              "revoke_loop": revoke_loop})

@@ -79,7 +79,7 @@ async def test_watchdog_reconnects_primary():
     main_p.down = False
     await bot.watchdog.coro()
     check(bot.xui is not None and bot.primary.api is bot.xui, "панель не переподключилась")
-    check(any("снова доступна" in t for t in admin), "нет оповещения о восстановлении")
+    check(any("снова работает" in t for t in admin), "нет оповещения о восстановлении")
     await saved.close()
 
 

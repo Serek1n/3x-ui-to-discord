@@ -46,8 +46,9 @@ def load(api=True, extras=1, **env):
     xui_api.XUIApi.RETRIES = int(os.environ.get("TEST_XUI_RETRIES", "1"))  # без пауз на повторах
     admin = []
 
-    async def fake_notify(text, key=None, cooldown=0):
-        admin.append(text)
+    async def fake_notify(text, key=None, cooldown=0, *, title=None, level=None, fields=None, who=None):
+        extra = "".join(f"\n{f[0]}: {f[1]}" for f in (fields or []))
+        admin.append((f"{title}: {text}" if title else text) + extra)
     bot.notify_admin = fake_notify
     bot.client = FakeClient()
     return bot, db, main_p, milan, admin
