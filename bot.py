@@ -1712,7 +1712,7 @@ async def status_server_cmd(interaction: discord.Interaction):
 
     if not STATUS_WEBHOOK_URL:
         await interaction.response.send_message(
-            "STATUS_WEBHOOK_URL не настроен на сервере - обратитесь к администратору.",
+            "`STATUS_WEBHOOK_URL` не настроен на сервере - обратитесь к администратору.",
             ephemeral=True,
         )
         return
@@ -1903,7 +1903,7 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
         lines.append(f"**{p.name}:** {state}")
     if xui is not None and not api_mode():
         lines.append("⚠️ Резервный режим через браузер: если обновится интерфейс панели, выдача может "
-                     "сломаться. Надёжнее перейти на XUI_API_TOKEN.")
+                     "сломаться. Надёжнее перейти на `XUI_API_TOKEN`.")
     loops = ", ".join(f"{n} {'✅' if l.is_running() else '🔴'}" for n, l in BACKGROUND_LOOPS.items())
     lines.append(f"**Фоновые задачи:** {loops or 'ещё не запущены'}")
     gid = home_guild_id()

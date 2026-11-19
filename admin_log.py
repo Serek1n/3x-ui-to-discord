@@ -72,6 +72,15 @@ def _strip_ids(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", t).strip(" :")
 
 
+def _plain_underscores(text: str) -> str:
+    """XUI_BASE_URL -> XUI\\_BASE\\_URL вне `кода`: иначе Discord считает
+    подчёркивания разметкой курсива и текст между ними съезжает."""
+    parts = text.split("`")
+    for i in range(0, len(parts), 2):          # чётные куски - вне `...`
+        parts[i] = re.sub(r"(?<=\w)_", r"\\_", parts[i])
+    return "`".join(parts)
+
+
 def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -202,10 +211,11 @@ class AdminLog:
                 shown = ", ".join(self.name(w) for w in who[:15])
                 more = f" и ещё {len(who) - 15}" if len(who) > 15 else ""
                 desc = (desc + "\n\n" if desc else "") + f"**Кого касается ({len(who)}):** {shown}{more}"
-        emb = discord.Embed(title=_short(title, 250), description=_short(desc, MAX_DESC) or None, color=color,
+        emb = discord.Embed(title=_short(title, 250), description=_short(_plain_underscores(desc), MAX_DESC) or None,
+                            color=color,
                             timestamp=discord.utils.utcnow())
         for name, value, *inline in first.fields[:20]:
-            emb.add_field(name=_short(str(name), 250), value=_short(str(value), 1000) or "—",
+            emb.add_field(name=_short(str(name), 250), value=_short(_plain_underscores(str(value)), 1000) or "—",
                           inline=bool(inline[0]) if inline else True)
         return emb
 
