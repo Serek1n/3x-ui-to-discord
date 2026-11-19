@@ -42,6 +42,7 @@ import os
 import re
 import time
 import math
+import random
 from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
@@ -283,7 +284,18 @@ def configured_extras() -> list:
     """Доп. серверы из настроек, подключены они сейчас или нет. Удаление и
     сверка идут по этому списку: сервер, недоступный в момент запуска бота,
     не должен выпадать из учёта."""
-    return [p for p in extra_panels if p.env.get("token") and p.env.get("sub_base_ok")]
+    return [p for p in extra_panels if p.env.get("token") and p.env.get("sub_base_ok")
+            and _norm_url(p.env.get("base_url")) != _norm_url(XUI_BASE_URL)]
+
+
+def _norm_url(url) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+
+def duplicate_extras() -> list:
+    """Доп. серверы с тем же адресом панели, что у основного - их бот не использует."""
+    return [p.name for p in extra_panels if p.env.get("token")
+            and _norm_url(p.env.get("base_url")) == _norm_url(XUI_BASE_URL)]
 
 
 link_server: LinkServer | None = None
@@ -709,6 +721,52 @@ class ExtrasOffline(XUIError):
     """Часть доп. серверов не подключена - проверка отложена до подключения."""
 
 
+# Проверка, та ли панель указана основной (XUI_BASE_URL). None - ещё не
+# проверяли, True - похоже, не та: бот ничего не восстанавливает и не меняет
+# в базе, иначе всем подписчикам ушли бы новые ссылки.
+_primary_suspect = None
+_restore_log: deque = deque()
+
+
+async def check_primary_panel() -> bool:
+    """Сравнивает случайные подписки из базы с основной панелью: у настоящей
+    основной панели клиенты есть и subId совпадают. True - всё в порядке."""
+    global _primary_suspect
+    subs = db.list_subscriptions()
+    if xui is None or not api_mode() or len(subs) < 3:
+        _primary_suspect = False if xui is not None else _primary_suspect
+        return xui is not None
+    sample = random.sample(subs, min(10, len(subs)))
+    match = 0
+    for s in sample:
+        found = await _lookup(xui, s["email"])     # XUIError - решим в следующий раз
+        if isinstance(found, dict) and found.get("subId") == s["sub_id"]:
+            match += 1
+    ok = match * 2 >= len(sample)
+    if not ok and _primary_suspect is not True:
+        await notify_admin(
+            f"На панели «{primary.name}» нет большинства подписок из базы бота - похоже, в XUI_BASE_URL "
+            f"указана не та панель. Пока это так, бот не восстанавливает «пропавших» клиентов и не "
+            f"меняет ссылки. Укажите в блоке XUI_… панель, где созданы подписки, и перезапустите бота.",
+            title="Основная панель не та", level="error",
+            fields=[("Совпало подписок", f"{match} из {len(sample)}"),
+                    ("Адрес", _norm_url(XUI_BASE_URL).split("//")[-1].split("/")[0], True)])
+    elif ok and _primary_suspect:
+        await notify_admin("Подписки из базы найдены на основной панели, сверка работает как обычно.",
+                           title="Основная панель в порядке", level="ok")
+    _primary_suspect = not ok
+    return ok
+
+
+def _restore_allowed() -> bool:
+    """Не больше max(2, 20% подписок) восстановлений за час."""
+    now = time.time()
+    while _restore_log and now - _restore_log[0] > 3600:
+        _restore_log.popleft()
+    limit = max(2, math.ceil(sum(db.count_subscriptions().values()) * 0.2))
+    return len(_restore_log) < limit
+
+
 async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
     """Сверяет запись в БД с панелями (не чаще раза в CHECK_TTL на человека).
     Клиент платной подписки пропал с основного сервера - создаётся заново и
@@ -716,6 +774,8 @@ async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
     did = sub["discord_id"]
     if xui is None or (not force and time.time() - _checked.get(did, 0) < CHECK_TTL):
         return False
+    if _primary_suspect is not False and api_mode():
+        return False   # основная панель не проверена или похожа на чужую
     found = await _lookup(xui, sub["email"])
     if found is None:
         if sub["kind"] != "paid":
@@ -725,6 +785,13 @@ async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
                                who=[did])
             _checked[did] = time.time()
             return False
+        if not _restore_allowed():
+            await notify_admin(
+                "За час пропало слишком много клиентов, остальных бот не пересоздаёт - проверьте основную "
+                "панель. Восстановление продолжится через час или после `/sync confirm:True`.",
+                title="Восстановление приостановлено", level="error", key="restore_hold", cooldown=3600)
+            return False
+        _restore_log.append(time.time())
         link = await _create_sub(did, "paid", member=member, source=_sub_source(sub))
         await notify_admin("Клиент пропал из панели и создан заново, человеку отправлена новая ссылка.",
                            level="ok", title="Подписка восстановлена", who=[did])
@@ -1746,6 +1813,7 @@ async def sync_cmd(interaction: discord.Interaction, confirm: bool = False):
         # Админ подтвердил: следующие 10 минут удаления идут без лимита.
         _revoke_hold = False
         _revoke_approved_until = time.time() + 600
+        _restore_log.clear()
         await notify_admin("Отложенные удаления выполняются.", level="ok", title="Удаления подтверждены",
                            who=[interaction.user.id])
     stats = await reconcile(force_check=True)
@@ -1822,6 +1890,11 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
         return
     await interaction.response.defer(ephemeral=True)
     lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
+    if _primary_suspect:
+        lines.append("🔴 На основной панели нет большинства подписок из базы - похоже, указана не та панель. "
+                     "Восстановление клиентов и смена ссылок остановлены.")
+    for name in duplicate_extras():
+        lines.append(f"🔴 **{name}:** тот же адрес, что у основной панели - не используется")
     for p in extra_panels:
         if p not in configured_extras():
             state = "⚪ не настроен (нужны токен и адрес подписок)"
@@ -2384,6 +2457,11 @@ async def reconcile(force_check: bool = False) -> Counter:
             _checked.clear()
 
         # Кому нужно что-то сделать: у кого есть роль, и у кого есть подписка.
+        if api_mode():
+            try:
+                await check_primary_panel()
+            except XUIError as e:
+                log.warning("Проверка основной панели: %s", e)
         to_check = {did for did, m in members.items() if access(m) & WATCHED_KINDS}
         to_check |= {did for did in subs if did in members}
         for did in to_check:
@@ -2615,6 +2693,8 @@ async def _connect_primary() -> bool:
         return False
     xui = api
     primary.api = api
+    global _primary_suspect
+    _primary_suspect = None   # новая панель - проверить заново
     log.info("Подключение к 3x-ui успешно (%s).", api.login_debug_info)
     return True
 
@@ -2836,6 +2916,12 @@ async def on_ready():
             + ". Роли и команды там не действуют. Удалите бота оттуда и выключите «Public Bot» в "
               "Developer Portal → Bot.", title="Бот на чужих серверах", level="error",
             key="foreign_guilds", cooldown=24 * 3600)
+
+    dup = duplicate_extras()
+    if dup:
+        await notify_admin("Адрес панели у них тот же, что у основного сервера (XUI_BASE_URL), поэтому бот их "
+                           "не использует. Проверьте блоки XUI_… и XUIn_… в .env.",
+                           title="Серверы совпадают с основным: " + ", ".join(dup), level="error")
 
     BACKGROUND_LOOPS.update({"check_expired": check_expired, "check_sharing": check_sharing,
                              "revoke_loop": revoke_loop})

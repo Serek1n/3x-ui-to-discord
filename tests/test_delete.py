@@ -167,6 +167,46 @@ async def test_old_server_links_removed():
     check(url in linked, "ссылка действующего доп. сервера пропала")
 
 
+async def test_wrong_primary_panel_changes_nothing():
+    """Основной по ошибке указана панель доп. сервера: никаких новых ссылок и правок базы."""
+    ms = [Member(i, V, guild=home) for i in range(300, 306)]
+    for m in ms:
+        await bot.sync_member(m)
+    before = {s["discord_id"]: s["sub_id"] for s in db.list_subscriptions()}
+    real_main = bot.xui
+    wrong = bot.extra_panels[0].api
+    bot.xui = bot.primary.api = wrong          # как если бы в XUI_BASE_URL стоял адрес доп. сервера
+    bot._primary_suspect = None
+    admin.clear()
+    try:
+        await bot.reconcile(force_check=True)
+    finally:
+        bot.xui = bot.primary.api = real_main
+    after = {s["discord_id"]: s["sub_id"] for s in db.list_subscriptions()}
+    check(after == before, "база изменена при чужой основной панели")
+    check(not any(m.dms[1:] for m in ms), "людям ушли новые ссылки")
+    check(any("Основная панель не та" in t for t in admin), f"нет предупреждения: {admin}")
+    bot._primary_suspect = None
+    await bot.reconcile(force_check=True)
+    check(bot._primary_suspect is False, "после возврата правильной панели проверка не прошла")
+
+
+async def test_mass_restore_is_limited():
+    ms = [Member(i, V, guild=home) for i in range(400, 410)]
+    for m in ms:
+        await bot.sync_member(m)
+    bot._primary_suspect = False
+    bot._restore_log.clear()
+    for m in ms[:6]:
+        main_p.clients.pop(f"discord_{m.id}")
+    admin.clear()
+    for m in ms[:6]:
+        await bot.ensure_consistent(m, db.get_subscription(str(m.id)), force=True)
+    restored = sum(1 for m in ms[:6] if f"discord_{m.id}" in main_p.clients)
+    check(restored == 2, f"восстановлено {restored}, ждали не больше лимита 2")
+    check(any("Восстановление приостановлено" in t for t in admin), "нет предупреждения о паузе")
+
+
 async def test_orphans_found():
     main_p.clients["discord_999"] = {"email": "discord_999", "subId": "x", "uuid": "u", "expiryTime": 0}
     orphans = await bot.find_orphans()
@@ -191,4 +231,5 @@ run([test_grant_creates_on_both_and_links, test_extra_down_main_still_deleted_an
      test_extra_not_connected_keeps_record, test_panel_error_is_not_absence,
      test_trial_not_started_survives_panel_error, test_trial_started_expires, test_trial_reminder_once,
      test_missing_paid_client_restored, test_extra_missing_is_recreated, test_manual_links_kept,
-     test_old_server_links_removed, test_orphans_found, test_primary_down_reconcile_skips], setup=setup)
+     test_old_server_links_removed, test_wrong_primary_panel_changes_nothing, test_mass_restore_is_limited,
+     test_orphans_found, test_primary_down_reconcile_skips], setup=setup)
