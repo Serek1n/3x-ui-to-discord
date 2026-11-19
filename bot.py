@@ -63,6 +63,7 @@ from xui_client import XUIClient, XUIError  # noqa: E402
 from xui_api import XUIApi, recent_ips  # noqa: E402
 import rf_check  # noqa: E402
 from link_server import LinkServer  # noqa: E402
+from bot_sub import SubAggregator  # noqa: E402
 from admin_log import AdminLog  # noqa: E402
 
 log = logging.getLogger("nexus")
@@ -181,6 +182,12 @@ REISSUE_COOLDOWN_SEC = _env_int("REISSUE_COOLDOWN_SEC", "600")
 # Кнопка «Добавить в Nexus»: публичный https-адрес переходника (домен и порт),
 # например https://vpn.example.com:8444. Пусто - кнопки нет.
 NEXUS_LINK_BASE = _env("NEXUS_LINK_BASE", "").rstrip("/")
+# Подписку выдаёт сам бот: {NEXUS_LINK_BASE}/sub/<токен>. Все серверы равноправны,
+# страны можно добавлять, убирать и менять, ссылка у людей не меняется.
+BOT_SUBSCRIPTION = _env_bool("BOT_SUBSCRIPTION", "false")
+SUB_TITLE = _env("SUB_TITLE", "NEXUS VPN")
+SUB_RENAME_CONFIGS = _env_bool("SUB_RENAME_CONFIGS", "true")   # конфиги называются как серверы
+SUB_UPDATE_HOURS = _env_int("SUB_UPDATE_HOURS", "12")
 NEXUS_LINK_HOST = _env("NEXUS_LINK_HOST", "0.0.0.0")
 NEXUS_LINK_PORT = _env_int("NEXUS_LINK_PORT", "8444")
 # Сертификат и ключ (те же файлы, что у панели 3x-ui). Без них переходник
@@ -222,6 +229,7 @@ class Panel:
     check_explicit: bool = False   # адрес проверки задан в .env (иначе - порт VPN из панели)
     api: XUIApi | None = None
     env: dict = field(default_factory=dict)
+    retired: bool = False   # выводится: новых клиентов не получает, но удаление идёт и на нём
 
     @property
     def client(self):
@@ -250,7 +258,7 @@ extra_panels: list[Panel] = []
 # у всех остался бы мёртвый сервер (бот считал бы ссылку добавленной вручную).
 OLD_SUB_BASES = [x.rstrip("/") for x in re.split(r"[\s,;]+", _env("XUI_OLD_SUB_BASES")) if x.startswith("http")]
 
-for _n in range(2, 6):
+for _n in range(2, 21):
     _base = _env(f"XUI{_n}_BASE_URL")
     if not _base:
         continue
@@ -260,6 +268,7 @@ for _n in range(2, 6):
         sub_base=_sub,
         check_target=_env(f"XUI{_n}_CHECK_TARGET") or _host_port(_sub),
         check_explicit=bool(_env(f"XUI{_n}_CHECK_TARGET")),
+        retired=_env_bool(f"XUI{_n}_RETIRED", "false"),
         env={
             "base_url": _base,
             "token": os.environ.get(f"XUI{_n}_API_TOKEN", "").strip(),
@@ -286,6 +295,17 @@ def configured_extras() -> list:
     не должен выпадать из учёта."""
     return [p for p in extra_panels if p.env.get("token") and p.env.get("sub_base_ok")
             and _norm_url(p.env.get("base_url")) != _norm_url(XUI_BASE_URL)]
+
+
+def serving_extras() -> list:
+    """Доп. серверы, на которых создаются клиенты и которые попадают в подписки
+    (выводимые - XUIn_RETIRED=true - только для удаления)."""
+    return [p for p in configured_extras() if not p.retired]
+
+
+def bot_mode() -> bool:
+    """Подписку выдаёт бот (нужны BOT_SUBSCRIPTION=true, NEXUS_LINK_BASE и API-токен)."""
+    return BOT_SUBSCRIPTION and bool(NEXUS_LINK_BASE) and api_mode()
 
 
 def _norm_url(url) -> str:
@@ -333,6 +353,25 @@ def sub_link(sub_id: str) -> str:
 def plain_sub_url(sub_id: str) -> str:
     """Ссылка подписки без параметров Happ - для Nexus."""
     return f"{XUI_SUB_BASE}/{sub_id}"
+
+
+def link_id(sub: dict) -> str:
+    """То, что стоит в конце ссылки: токен бота или subId основного сервера."""
+    return db.get_token(sub["discord_id"]) if bot_mode() else sub["sub_id"]
+
+
+def plain_user_url(sub: dict) -> str:
+    if bot_mode():
+        return f"{NEXUS_LINK_BASE}/sub/{db.get_token(sub['discord_id'])}"
+    return plain_sub_url(sub["sub_id"])
+
+
+def user_link(sub: dict) -> str:
+    """Ссылка подписки для человека (с параметрами Happ, если заданы)."""
+    base = plain_user_url(sub)
+    if HAPP_PROVIDER_ID:
+        base += f"#?providerid={HAPP_PROVIDER_ID}&ping-type=tcp"
+    return base
 
 
 def _sub_id_from_link(link: str) -> str:
@@ -465,8 +504,10 @@ async def send_dm(user, text: str, link: str | None = None):
                 await user.send(text, file=make_qr_file(link))
         else:
             await user.send(text)
+        return True
     except (discord.Forbidden, discord.HTTPException):
         log.info("Не удалось написать в ЛС пользователю %s", getattr(user, "id", user))
+        return False
 
 
 admin_log = AdminLog(ADMIN_LOG_WEBHOOK_URL, mode=ADMIN_LOG_MODE, dm_ids=ADMIN_DM_IDS)
@@ -526,7 +567,7 @@ async def _create_on_extras(email: str, expiry_time: int, comment: str):
     [серверы, где не получилось]). Ошибка на одном сервере не мешает выдаче:
     сверка досоздаст клиента позже (см. ensure_extras)."""
     subs, failed = {}, []
-    for panel in configured_extras():
+    for panel in serving_extras():
         if panel.api is None:
             failed.append(panel.name)
             continue
@@ -553,12 +594,13 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
         created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT,
                                        expiry_time=expiry_time, comment=comment)
         extra_subs, failed = await _create_on_extras(email, expiry_time, comment)
-        try:
-            await _link_extras(email, created["subId"], extra_subs)
-        except XUIError as e:
-            failed.append("внешние ссылки")
-            await notify_admin(f"Причина: {e}", key=f"links:{email}", level="warn",
-                               title="Доп. серверы не добавлены в подписку", who=[email[8:]])
+        if not bot_mode():   # в режиме бота подписку собирает бот, внешние ссылки не нужны
+            try:
+                await _link_extras(email, created["subId"], extra_subs)
+            except XUIError as e:
+                failed.append("внешние ссылки")
+                await notify_admin(f"Причина: {e}", key=f"links:{email}", level="warn",
+                                   title="Доп. серверы не добавлены в подписку", who=[email[8:]])
     else:
         days = TRIAL_DAYS if kind == "trial" else 0
         created = await xui.add_client(XUI_INBOUND_ID, email, days, ip_limit=DEVICE_LIMIT)
@@ -573,6 +615,10 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
     else:
         _checked[discord_id] = time.time()
     log.info("Выдана подписка %s пользователю %s", kind, discord_id)
+    if bot_mode():
+        db.mark_link_sent(discord_id)   # ссылку человек получит в этом же сообщении
+        sub_cache_forget(discord_id)
+        return user_link(db.get_subscription(discord_id))
     return sub_link(created["subId"])
 
 
@@ -626,6 +672,7 @@ async def _delete_sub(sub: dict, reason: str = ""):
         errors.append(str(e))
     if errors:
         raise XUIError("удаление не завершено: " + "; ".join(errors))
+    sub_cache_forget(sub["discord_id"], sub["email"])
     db.delete_subscription(sub["discord_id"])
     if reason:
         db.log_event(sub["discord_id"], "end", source=_sub_source(sub), detail=reason)
@@ -686,7 +733,7 @@ async def ensure_extras(sub: dict):
     нет, и прописывает внешнюю подписку. Клиент, который есть на доп. сервере,
     но не привязан к подписке основного, считается устаревшим (например,
     остался от неудачного перевыпуска) и пересоздаётся с новыми ключами."""
-    panels = configured_extras() if api_mode() else []
+    panels = serving_extras() if api_mode() else []
     if not panels:
         return
     email = sub["email"]
@@ -721,6 +768,113 @@ class ExtrasOffline(XUIError):
     """Часть доп. серверов не подключена - проверка отложена до подключения."""
 
 
+async def _expiry_for_new_client(sub: dict) -> int:
+    """Срок для клиента, которого досоздаём на сервере: платный - бессрочно,
+    пробный - тот же, что на остальных серверах (не новый полный срок)."""
+    if sub["kind"] != "trial":
+        return 0
+    state, ms = await _panel_expiry_state(sub)
+    if state == "started":
+        return ms
+    if state == "not_started":
+        return -TRIAL_DAYS * 86_400_000
+    if state == "absent" and sub.get("expiry_ms", 0) > 0:
+        return sub["expiry_ms"]
+    if state == "absent":
+        return -TRIAL_DAYS * 86_400_000
+    raise XUIError("срок пробной подписки пока не известен (панель не отвечает)")
+
+
+async def ensure_all_servers(sub: dict):
+    """Режим подписки от бота: клиент человека должен быть на каждом сервере
+    (основной - такой же, как остальные). Чего нет - создаётся."""
+    did, email = sub["discord_id"], sub["email"]
+    expiry_time, missing, created_any = None, [], False
+    for panel in [primary] + serving_extras():
+        api = xui if panel is primary else panel.api
+        if api is None:
+            missing.append(panel.name)
+            continue
+        found = await _lookup(api, email)
+        if found is None:
+            if expiry_time is None:
+                expiry_time = await _expiry_for_new_client(sub)
+            found = await api.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time)
+            created_any = True
+            log.info("Клиент %s создан на сервере «%s» при сверке", email, panel.name)
+        if panel is primary and isinstance(found, dict):
+            sid, uid = found.get("subId"), found.get("uuid") or found.get("id")
+            if sid and sid != sub["sub_id"]:
+                db.update_client_ids(did, str(uid or sub["client_uuid"]), sid)
+    if created_any:
+        sub_cache_forget(did)
+    if missing:
+        raise ExtrasOffline("не подключены серверы: " + ", ".join(missing))
+
+
+# ---------- подписка от бота ----------
+
+async def _sub_sources(sub: dict) -> list:
+    """[(название сервера, адрес подписки человека на нём или None, проверять сертификат)]"""
+    out = []
+    for panel in [primary] + serving_extras():
+        api = xui if panel is primary else panel.api
+        verify = XUI_VERIFY_SSL if panel is primary else panel.env.get("verify_ssl", True)
+        url = None
+        if api is not None:
+            try:
+                found = await _lookup(api, sub["email"])
+                if isinstance(found, dict) and found.get("subId"):
+                    url = f"{panel.sub_base}/{found['subId']}"
+            except XUIError as e:
+                log.warning("Подписка: сервер «%s» не ответил: %s", panel.name, e)
+        out.append((panel.name, url, verify))
+    return out
+
+
+sub_aggregator = SubAggregator(_sub_sources, title=SUB_TITLE, rename_configs=SUB_RENAME_CONFIGS,
+                               update_hours=SUB_UPDATE_HOURS)
+
+
+async def serve_subscription(token: str):
+    """Для переходника: (тело, заголовки), None - нет такой подписки, "unavailable" - сервера молчат."""
+    sub = db.get_subscription_by_token(token)
+    if sub is None or xui is None:
+        return None if sub is None else "unavailable"
+    result = await sub_aggregator.build(token, sub)
+    return result if result is not None else "unavailable"
+
+
+def sub_cache_forget(discord_id: str, email: str = None):
+    token = db.get_token(discord_id, create=False)
+    sub_aggregator.forget(token=token, email=email)
+
+
+async def send_new_links(limit: int = 20) -> int:
+    """Переход на ссылку от бота: один раз присылает постоянную ссылку тем, кто
+    её ещё не получал (старая ссылка работает, пока жив её сервер)."""
+    if not bot_mode():
+        return 0
+    sent = 0
+    for sub in db.list_unsent_links()[:limit]:
+        if sub.get("revoke_at"):
+            continue
+        member = find_member(int(sub["discord_id"]))
+        if member is None:
+            continue
+        link = user_link(sub)
+        ok = await send_dm(member, "🔄 **Новая ссылка на NEXUS VPN**\n"
+                                   "Теперь все серверы - в одной подписке, и эта ссылка больше не изменится, "
+                                   "даже когда мы добавим новые страны.\n"
+                                   "Удалите старую подписку в приложении и добавьте эту:\n" + link, link)
+        db.mark_link_sent(sub["discord_id"])
+        sent += 1 if ok else 0
+        await asyncio.sleep(1)
+    if sent:
+        await notify_admin(f"Новая постоянная ссылка отправлена {sent} подписчикам.", title="Переход на ссылку от бота")
+    return sent
+
+
 # Проверка, та ли панель указана основной (XUI_BASE_URL). None - ещё не
 # проверяли, True - похоже, не та: бот ничего не восстанавливает и не меняет
 # в базе, иначе всем подписчикам ушли бы новые ссылки.
@@ -732,6 +886,9 @@ async def check_primary_panel() -> bool:
     """Сравнивает случайные подписки из базы с основной панелью: у настоящей
     основной панели клиенты есть и subId совпадают. True - всё в порядке."""
     global _primary_suspect
+    if bot_mode():
+        _primary_suspect = False   # ссылки не зависят от основной панели
+        return True
     subs = db.list_subscriptions()
     if xui is None or not api_mode() or len(subs) < 3:
         _primary_suspect = False if xui is not None else _primary_suspect
@@ -773,6 +930,12 @@ async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
     человеку уходит новая ссылка. Возвращает True, если клиента восстановили."""
     did = sub["discord_id"]
     if xui is None or (not force and time.time() - _checked.get(did, 0) < CHECK_TTL):
+        return False
+    if bot_mode():
+        # Ссылка у человека от бота и от серверов не зависит: недостающих клиентов
+        # просто создаём на всех серверах, без новых ссылок и сообщений.
+        await ensure_all_servers(sub)
+        _checked[did] = time.time()
         return False
     if _primary_suspect is not False and api_mode():
         return False   # основная панель не проверена или похожа на чужую
@@ -861,12 +1024,16 @@ async def reissue_link(discord_id: str):
         raise last
     db.update_client_ids(discord_id, created["uuid"], created["subId"])
     extra_subs, failed = await _create_on_extras(email, expiry_time, "")
-    try:
-        await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
-    except XUIError as e:
-        failed.append("внешние ссылки")
-        await notify_admin(f"Причина: {e}", level="warn", title="Перевыпуск: доп. серверы не добавлены",
-                           who=[email[8:]])
+    if bot_mode():
+        sub_cache_forget(discord_id)
+        db.rotate_token(discord_id)     # старая ссылка бота перестаёт работать
+    else:
+        try:
+            await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
+        except XUIError as e:
+            failed.append("внешние ссылки")
+            await notify_admin(f"Причина: {e}", level="warn", title="Перевыпуск: доп. серверы не добавлены",
+                               who=[email[8:]])
     # Сервер, где ключи не заменились, остаётся непроверенным: сверка пересоздаст
     # там клиента, потому что он не привязан к новой подписке.
     if failed:
@@ -874,6 +1041,8 @@ async def reissue_link(discord_id: str):
     else:
         _checked[discord_id] = time.time()
     log.info("Перевыпущена ссылка пользователя %s", discord_id)
+    if bot_mode():
+        return user_link(db.get_subscription(discord_id)), failed
     return sub_link(created["subId"]), [f for f in failed if f != "внешние ссылки"]
 
 
@@ -1274,19 +1443,19 @@ async def myvpn(interaction: discord.Interaction):
             expiry = f"<t:{sub['expiry_ms'] // 1000}:F>"
 
     lines = [f"Подписка: {kind}", f"Срок действия: {expiry}", f"Устройств: до {DEVICE_LIMIT}"]
-    servers = [primary.name] + [p.name for p in active_extras()]
+    servers = [primary.name] + [p.name for p in active_extras() if not p.retired]
     if len(servers) > 1:
         lines.append("Серверы: " + ", ".join(servers))
     traffic = await _traffic_total(sub["email"])
     if traffic:
         lines.append(f"Использовано: ↑{traffic[0] / 1024 ** 3:.2f} ГБ / ↓{traffic[1] / 1024 ** 3:.2f} ГБ")
 
-    link = sub_link(sub["sub_id"])
+    link = user_link(sub)
     lines.append(f"Ссылка: {link}")
     await interaction.followup.send(
         "\n".join(lines),
         file=make_qr_file(link),
-        view=MyVPNView(interaction.user.id, can_reissue=api_mode(), sub_id=sub["sub_id"]),
+        view=MyVPNView(interaction.user.id, can_reissue=api_mode(), sub_id=link_id(sub)),
         ephemeral=True,
     )
 
@@ -1890,6 +2059,11 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
         return
     await interaction.response.defer(ephemeral=True)
     lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
+    lines.append("**Подписка:** " + ("от бота - одна постоянная ссылка, серверы равноправны" if bot_mode()
+                                      else "от основного сервера (доп. серверы - внешними ссылками)"))
+    unsent = len(db.list_unsent_links()) if bot_mode() else 0
+    if unsent:
+        lines.append(f"Ждут постоянную ссылку: {unsent} (бот пришлёт при сверке)")
     if _primary_suspect:
         lines.append("🔴 На основной панели нет большинства подписок из базы - похоже, указана не та панель. "
                      "Восстановление клиентов и смена ссылок остановлены.")
@@ -2504,6 +2678,11 @@ async def reconcile(force_check: bool = False) -> Counter:
             except XUIError as e:
                 log.warning("Поиск клиентов без записи в базе: %s", e)
 
+    if bot_mode():
+        try:
+            await send_new_links()
+        except Exception:
+            log.exception("Рассылка постоянных ссылок")
     due = await process_due_revokes()
     for key in ("revoked", "errors"):
         stats[key] += due.get(key, 0)
@@ -2836,6 +3015,11 @@ async def _setup():
         elif not XUI_API_TOKEN:
             log.warning("Сервер «%s» пропущен: доп. серверы работают, только если и основной "
                         "подключён через XUI_API_TOKEN.", panel.name)
+    if BOT_SUBSCRIPTION and not NEXUS_LINK_BASE:
+        log.error("BOT_SUBSCRIPTION=true, но NEXUS_LINK_BASE не задан: ссылки выдаются по-старому.")
+        await notify_admin("Для подписки от бота нужен адрес бота `NEXUS_LINK_BASE` (как для кнопки «Добавить "
+                           "в Nexus»). Пока его нет, ссылки выдаются по-старому.",
+                           title="Подписка от бота не включена", level="error")
     if not XUI_VERIFY_SSL:
         log.warning("XUI_VERIFY_SSL=false: сертификат панели не проверяется, соединение можно перехватить.")
 
@@ -2848,13 +3032,15 @@ async def _setup():
         def _sub_url_for(sub_id: str):
             # Страница открывается для любой подписки из базы. Срок здесь не
             # проверяется: у неначатого пробного периода он ещё не известен, а
-            # истёкшую подписку бот удаляет из базы сам.
-            sub = db.get_subscription_by_sub_id(sub_id)
-            return plain_sub_url(sub_id) if sub else None
+            # истёкшую подписку бот удаляет из базы сам. Старые кнопки (со subId)
+            # в режиме бота ведут на постоянную ссылку.
+            sub = db.get_subscription_by_token(sub_id) or db.get_subscription_by_sub_id(sub_id)
+            return plain_user_url(sub) if sub else None
 
         link_server = LinkServer(_sub_url_for, host=NEXUS_LINK_HOST, port=NEXUS_LINK_PORT,
                                  cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
-                                 download_url=NEXUS_DOWNLOAD_URL, logo_path=AVATAR_FILE)
+                                 download_url=NEXUS_DOWNLOAD_URL, logo_path=AVATAR_FILE,
+                                 sub_content=serve_subscription if BOT_SUBSCRIPTION else None)
         try:
             await link_server.start()
         except Exception as e:

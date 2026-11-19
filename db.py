@@ -12,6 +12,7 @@
 
 import os
 import sqlite3
+import secrets
 import time
 from contextlib import contextmanager
 
@@ -90,6 +91,69 @@ CREATE TABLE IF NOT EXISTS trials (
 """
 
 
+# Постоянная ссылка подписки от бота: {NEXUS_LINK_BASE}/sub/<token>. Токен
+# хранится отдельно от подписки и не зависит от серверов: смена основного
+# сервера, добавление и удаление стран ссылку не меняют. Новый токен - только
+# при перевыпуске ссылки. link_sent - человеку уже отправлена эта ссылка.
+TOKENS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tokens (
+    discord_id TEXT PRIMARY KEY,
+    token      TEXT NOT NULL UNIQUE,
+    link_sent  INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+)
+"""
+
+
+def _new_token() -> str:
+    return secrets.token_urlsafe(18)   # 24 символа: A-Z a-z 0-9 _ -
+
+
+def get_token(discord_id, create=True):
+    """Токен постоянной ссылки (создаётся при первом обращении)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT token FROM tokens WHERE discord_id = ?", (str(discord_id),)).fetchone()
+        if row:
+            return row["token"]
+        if not create:
+            return None
+        token = _new_token()
+        conn.execute("INSERT INTO tokens (discord_id, token, link_sent, created_at) VALUES (?, ?, 0, ?)",
+                     (str(discord_id), token, int(time.time())))
+        return token
+
+
+def rotate_token(discord_id):
+    """Перевыпуск: новый токен, старая ссылка перестаёт работать."""
+    token = _new_token()
+    with get_conn() as conn:
+        conn.execute("INSERT INTO tokens (discord_id, token, link_sent, created_at) VALUES (?, ?, 1, ?) "
+                     "ON CONFLICT(discord_id) DO UPDATE SET token = excluded.token, link_sent = 1, "
+                     "created_at = excluded.created_at", (str(discord_id), token, int(time.time())))
+    return token
+
+
+def get_subscription_by_token(token):
+    with get_conn() as conn:
+        row = conn.execute("SELECT s.* FROM subscriptions s JOIN tokens t ON t.discord_id = s.discord_id "
+                           "WHERE t.token = ?", (token,)).fetchone()
+        return dict(row) if row else None
+
+
+def mark_link_sent(discord_id, sent=True):
+    get_token(discord_id)
+    with get_conn() as conn:
+        conn.execute("UPDATE tokens SET link_sent = ? WHERE discord_id = ?", (1 if sent else 0, str(discord_id)))
+
+
+def list_unsent_links():
+    """Подписки, владельцам которых ещё не отправлена постоянная ссылка."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT s.* FROM subscriptions s LEFT JOIN tokens t ON t.discord_id = s.discord_id "
+                            "WHERE t.link_sent IS NULL OR t.link_sent = 0").fetchall()
+        return [dict(r) for r in rows]
+
+
 @contextmanager
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -131,6 +195,7 @@ def init_db():
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN revoke_at INTEGER NOT NULL DEFAULT 0")
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS subscriptions_sub_id ON subscriptions (sub_id)")
+        conn.execute(TOKENS_SCHEMA)
         _backfill_events(conn)
 
 

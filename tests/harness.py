@@ -17,9 +17,10 @@ HOME = 1
 DAY = 86_400_000
 
 
-def load(api=True, extras=1, **env):
-    """Импортирует бота с тестовыми настройками. Возвращает (bot, db, main, milan, admin_msgs)."""
-    main_p, milan = FakePanel("tok1", "/secretpath"), FakePanel("tok2", "/m")
+def load(api=True, extras=1, sub_on_panel=False, **env):
+    """Импортирует бота с тестовыми настройками. Возвращает (bot, db, main, milan, admin_msgs).
+    sub_on_panel - адреса подписок ведут на заглушки (для режима подписки от бота)."""
+    main_p, milan = FakePanel("tok1", "/secretpath", "fi.example"), FakePanel("tok2", "/m", "nl.example")
     tmp = tempfile.mkdtemp()
     e = dict(DISCORD_TOKEN="x", DB_PATH=os.path.join(tmp, "t.db"), TRIAL_DAYS="10", DEVICE_LIMIT="3",
              VPN_ROLE_NAME=V, VPN_GIFT_ROLES=G, TRIAL_ROLE_NAME=T, ADMIN_ROLE_NAME=A, GUILD_ID=str(HOME),
@@ -34,6 +35,8 @@ def load(api=True, extras=1, **env):
     if extras:
         e.update(XUI2_BASE_URL=milan.url, XUI2_API_TOKEN="tok2", XUI2_WEB_BASE_PATH="m",
                  XUI2_SUB_BASE="https://m.example:2096/s", XUI2_NAME="Милан")
+    if sub_on_panel:
+        e.update(XUI_SUB_BASE=main_p.url + "/subsrv", XUI2_SUB_BASE=milan.url + "/subsrv")
     e.update({k: str(v) for k, v in env.items()})
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         os.environ.pop(k, None)
@@ -83,6 +86,9 @@ def reset(bot, db, *panels):
     bot._revoke_log.clear()
     bot._revoke_hold = False
     bot._revoke_approved_until = 0.0
+    if hasattr(bot, "sub_aggregator"):
+        bot.sub_aggregator._cache.clear()
+        bot.sub_aggregator._last_good.clear()
 
 
 def run(tests, setup=None):

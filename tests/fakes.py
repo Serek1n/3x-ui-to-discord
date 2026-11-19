@@ -12,8 +12,8 @@ class FakePanel:
     Поведение повторяет исходники 3x-ui: нет клиента -> success:true, obj:null;
     ошибка -> HTTP 200 и success:false."""
 
-    def __init__(self, token="tok", base="/secretpath"):
-        self.token, self.base = token, base
+    def __init__(self, token="tok", base="/secretpath", host="srv.example"):
+        self.token, self.base, self.host = token, base, host
         self.clients, self.links, self.ips = {}, {}, {}
         self.calls = []
         self.fail_traffic = 0      # сколько раз ответить success:false на traffic
@@ -40,6 +40,21 @@ class FakePanel:
                 body = json.loads(self.rfile.read(n) or b"null") if n else None
                 if panel.down:
                     return self._send(503, None, raw=b"<html>503</html>")
+                if method == "GET" and path.startswith("/subsrv/"):
+                    # Сервис подписок 3x-ui: без токена, base64 со ссылками.
+                    sid = path[len("/subsrv/"):]
+                    links = [f"vless://{c['uuid']}@{panel.host}:443?type=tcp&security=reality#{c['email']}"
+                             for c in panel.clients.values() if c["subId"] == sid]
+                    if not links:
+                        return self._send(404, None, raw=b"")
+                    import base64
+                    body = base64.b64encode("\n".join(links).encode())
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("subscription-userinfo", "upload=10; download=20; total=0; expire=0")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.headers.get("Authorization") != f"Bearer {panel.token}":
                     return self._send(401, {"success": False})
                 p = path[len(panel.base + "/panel/api/"):]

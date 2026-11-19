@@ -18,12 +18,20 @@ BASE = f"http://127.0.0.1:{PORT}"
 srv = None
 
 
+async def fake_sub(token):
+    if token == "tokenOK00000000000000000":
+        return "dmxlc3M6Ly94", {"Content-Type": "text/plain; charset=utf-8", "profile-update-interval": "12"}
+    if token == "tokenDOWN000000000000000":
+        return "unavailable"
+    return None
+
+
 async def setup():
     global srv
     if srv is not None:
         await srv.stop()
     srv = LinkServer(lambda s: VALID.get(s), host="0.0.0.0", port=PORT,
-                     download_url='https://x.example/"><script>alert(1)</script>')
+                     download_url='https://x.example/"><script>alert(1)</script>', sub_content=fake_sub)
     await srv.start()
 
 
@@ -72,6 +80,37 @@ async def test_normal_use_not_limited():
             check(r.status == 200, "обычное открытие страницы ограничено")
 
 
+async def test_bot_subscription_endpoint():
+    async with aiohttp.ClientSession(trust_env=False) as http:
+        r = await http.get(BASE + "/sub/tokenOK00000000000000000")
+        body = await r.text()
+        check(r.status == 200 and body == "dmxlc3M6Ly94" and r.headers["profile-update-interval"] == "12",
+              f"подписка: {r.status} {body!r}")
+        r = await http.get(BASE + "/sub/tokenDOWN000000000000000")
+        check(r.status == 503, f"недоступная подписка: {r.status}")
+        r = await http.get(BASE + "/sub/unknown00000000000000000")
+        check(r.status == 404, f"чужой токен: {r.status}")
+        r = await http.get(BASE + "/sub/..%2f.env")
+        check(r.status == 404, "путь с выходом из папки")
+
+
+async def test_sub_formats():
+    import base64
+    import json
+    from bot_sub import decode_body, rename, merge_userinfo, parse_userinfo
+    plain = "vless://a@h:1#x\ntrojan://b@h:2#y\n# comment\n"
+    check(decode_body(plain) == ["vless://a@h:1#x", "trojan://b@h:2#y"], "простой текст")
+    check(decode_body(base64.b64encode(plain.encode()).decode()) == ["vless://a@h:1#x", "trojan://b@h:2#y"], "base64")
+    check(decode_body("<html>oops</html>") == [], "мусор принят за подписку")
+    vm = "vmess://" + base64.b64encode(json.dumps({"add": "h", "ps": "old"}).encode()).decode()
+    out = json.loads(base64.b64decode(rename(vm, "🇩🇪 Германия")[8:]).decode())
+    check(out["ps"] == "🇩🇪 Германия" and out["add"] == "h", "vmess не переименован")
+    check(rename("vless://a@h:1?x=1#old", "PL").endswith("#PL"), "vless не переименован")
+    m = merge_userinfo([parse_userinfo("upload=1; download=2; total=0; expire=200"),
+                        parse_userinfo("upload=3; download=4; total=10; expire=100"), {}])
+    check(m == "upload=4; download=6; total=10; expire=100", m)
+
+
 async def test_sub_id_pattern():
     check(not SUB_ID_RE.match("a/b") and not SUB_ID_RE.match("a.b") and SUB_ID_RE.match("abcd_-12"), "")
 
@@ -79,4 +118,5 @@ async def test_sub_id_pattern():
 
 
 run([test_localhost_without_cert, test_page_is_safe, test_bad_paths_404, test_bruteforce_is_limited,
-     test_normal_use_not_limited, test_sub_id_pattern], setup=setup)
+     test_normal_use_not_limited, test_bot_subscription_endpoint, test_sub_formats, test_sub_id_pattern],
+    setup=setup)

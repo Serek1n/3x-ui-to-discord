@@ -214,8 +214,11 @@ class LinkServer:
     """sub_url_for(sub_id) -> ссылка подписки или None, если такой подписки нет."""
 
     def __init__(self, sub_url_for, *, host: str = "0.0.0.0", port: int = 8444,
-                 cert: str = "", key: str = "", download_url: str = "", logo_path: str = ""):
+                 cert: str = "", key: str = "", download_url: str = "", logo_path: str = "",
+                 sub_content=None):
         self.sub_url_for = sub_url_for
+        # sub_content(token) -> (тело, заголовки) | None (нет такой подписки) | "unavailable"
+        self.sub_content = sub_content
         self.host = host
         self.port = port
         self.cert = cert
@@ -274,6 +277,25 @@ class LinkServer:
                                 content_type="text/html", headers=HEADERS)
         return web.Response(text=self._render(sub_url), content_type="text/html", headers=HEADERS)
 
+    async def handle_sub(self, request: web.Request) -> web.Response:
+        """Подписка от бота: конфиги всех серверов одной ссылкой."""
+        ip = request.remote or "?"
+        now = time.time()
+        if self._limited(ip, now):
+            return web.Response(text="Too many requests", status=429, headers={"Retry-After": "600"})
+        self._hits.setdefault(ip, []).append(now)
+        token = request.match_info.get("token", "")
+        result = await self.sub_content(token) if SUB_ID_RE.match(token) else None
+        if result is None:
+            self._misses.setdefault(ip, []).append(now)
+            return web.Response(text="Not found", status=404, headers={"Cache-Control": "no-store"})
+        if result == "unavailable":
+            # Приложение сохранит прежний список серверов и попробует позже.
+            return web.Response(text="Temporarily unavailable", status=503,
+                                headers={"Retry-After": "300", "Cache-Control": "no-store"})
+        body, headers = result
+        return web.Response(text=body, headers=headers)
+
     async def handle_font(self, request: web.Request):
         name = request.match_info.get("name", "")
         path = os.path.join(FONTS_DIR, name)
@@ -304,6 +326,8 @@ class LinkServer:
     async def start(self):
         app = web.Application()
         app.router.add_get("/add/{sub_id}", self.handle_add)
+        if self.sub_content is not None:
+            app.router.add_get("/sub/{token}", self.handle_sub)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/logo.png", self.handle_logo)
         app.router.add_get("/fonts/{name}", self.handle_font)
