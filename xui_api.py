@@ -61,7 +61,9 @@ class XUIApi:
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             verify=verify_ssl,
-            timeout=timeout,
+            # Недоступный сервер не должен держать бота долго: на установку
+            # соединения - не больше 8 секунд.
+            timeout=httpx.Timeout(timeout, connect=8),
             follow_redirects=False,
         )
 

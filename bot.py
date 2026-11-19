@@ -2619,27 +2619,33 @@ async def _connect_primary() -> bool:
     return True
 
 
+_extras_lock = asyncio.Lock()
+
+
 async def _connect_extras() -> list:
-    """Подключает доп. серверы из настроек, которые ещё не подключены.
+    """Подключает доп. серверы из настроек, которые ещё не подключены - все
+    одновременно, чтобы недоступный сервер не задерживал остальные.
     Возвращает названия подключённых в этот раз."""
-    connected = []
-    if not XUI_API_TOKEN:
-        return connected
-    for panel in configured_extras():
-        if panel.api is not None:
-            continue
-        try:
-            panel.api = await XUIApi.create(
-                panel.env["base_url"], panel.env["token"], verify_ssl=panel.env["verify_ssl"],
-                web_base_path=panel.env["web_base_path"], name=panel.name,
-                inbound_ids=panel.env["inbound_ids"],
-            )
-            connected.append(panel.name)
-            log.info("Доп. сервер «%s» подключён (%s).", panel.name, panel.api.login_debug_info)
-        except XUIError as e:
-            log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
-            _last_error[panel.name] = str(e)
-    return connected
+    if not XUI_API_TOKEN or _extras_lock.locked():
+        return []
+    async with _extras_lock:
+        async def one(panel):
+            try:
+                api = await XUIApi.create(
+                    panel.env["base_url"], panel.env["token"], verify_ssl=panel.env["verify_ssl"],
+                    web_base_path=panel.env["web_base_path"], name=panel.name,
+                    inbound_ids=panel.env["inbound_ids"],
+                )
+            except XUIError as e:
+                log.error("Доп. сервер «%s» недоступен: %s", panel.name, e)
+                _last_error[panel.name] = str(e)
+                return None
+            panel.api = api
+            log.info("Доп. сервер «%s» подключён (%s).", panel.name, api.login_debug_info)
+            return panel.name
+
+        todo = [p for p in configured_extras() if p.api is None]
+        return [n for n in await asyncio.gather(*(one(p) for p in todo)) if n]
 
 
 BACKGROUND_LOOPS = {}
@@ -2737,7 +2743,9 @@ async def _setup():
     else:
         log.info("Подключаюсь к панели 3x-ui (headless-браузер, может занять 10-20 секунд)...")
     if await _connect_primary():
-        await _connect_extras()
+        # Доп. серверы подключаются в фоне (watchdog, сразу после запуска): если
+        # какой-то из них не отвечает, бот не должен из-за этого долго стартовать.
+        pass
     else:
         # Бот запускается и без панели: поддержка, рассылка и статистика работают,
         # а подключение повторяется в фоне (watchdog).
@@ -2813,6 +2821,10 @@ async def on_ready():
         return  # on_ready повторяется после переподключений
     _started = True
     _write_ready_marker()
+    if xui is not None:
+        # Доп. серверы - после отметки о запуске: deploy.sh уже видит, что бот
+        # работает, а сверка начнётся, когда серверы подключены (или не ответили).
+        await _connect_extras()
 
     gid = home_guild_id()
     foreign = [g for g in client.guilds if g.id != gid]
