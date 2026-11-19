@@ -148,6 +148,25 @@ async def test_manual_links_kept():
     check("https://other.example/x" in main_p.linked("discord_9"), "ручная внешняя ссылка стёрта")
 
 
+async def test_old_server_links_removed():
+    """Сервер убрали из .env - его ссылки удаляются из подписок, ручные остаются."""
+    m = Member(12, V, guild=home)
+    await bot.sync_member(m)
+    main_p.links["discord_12"] += [
+        {"kind": "subscription", "value": "https://old.example/s/abc", "remark": "Милан", "enable": True},
+        {"kind": "subscription", "value": "https://other.example/z", "remark": "ручная", "enable": True}]
+    bot.OLD_SUB_BASES = ["https://old.example/s"]
+    try:
+        await bot.reconcile(force_check=True)
+    finally:
+        bot.OLD_SUB_BASES = []
+    linked = main_p.linked("discord_12")
+    check("https://old.example/s/abc" not in linked, "ссылка старого сервера осталась")
+    check("https://other.example/z" in linked, "ручная ссылка стёрта")
+    url = f"https://m.example:2096/s/{milan.clients['discord_12']['subId']}"
+    check(url in linked, "ссылка действующего доп. сервера пропала")
+
+
 async def test_orphans_found():
     main_p.clients["discord_999"] = {"email": "discord_999", "subId": "x", "uuid": "u", "expiryTime": 0}
     orphans = await bot.find_orphans()
@@ -172,4 +191,4 @@ run([test_grant_creates_on_both_and_links, test_extra_down_main_still_deleted_an
      test_extra_not_connected_keeps_record, test_panel_error_is_not_absence,
      test_trial_not_started_survives_panel_error, test_trial_started_expires, test_trial_reminder_once,
      test_missing_paid_client_restored, test_extra_missing_is_recreated, test_manual_links_kept,
-     test_orphans_found, test_primary_down_reconcile_skips], setup=setup)
+     test_old_server_links_removed, test_orphans_found, test_primary_down_reconcile_skips], setup=setup)

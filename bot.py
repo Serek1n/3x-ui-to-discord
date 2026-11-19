@@ -244,6 +244,11 @@ primary = Panel(
 
 # Дополнительные серверы: XUI2_*, XUI3_*, ... (только через API-токен).
 extra_panels: list[Panel] = []
+# Адреса подписок серверов, которые больше не используются (через запятую). Их
+# ссылки сверка удалит из подписок людей - иначе после удаления сервера из .env
+# у всех остался бы мёртвый сервер (бот считал бы ссылку добавленной вручную).
+OLD_SUB_BASES = [x.rstrip("/") for x in re.split(r"[\s,;]+", _env("XUI_OLD_SUB_BASES")) if x.startswith("http")]
+
 for _n in range(2, 6):
     _base = _env(f"XUI{_n}_BASE_URL")
     if not _base:
@@ -500,7 +505,7 @@ async def _link_extras(email: str, sub_id: str, extra_subs: dict, preserve: list
     if not api_mode() or not (extra_subs or preserve):
         return
     await xui.set_external_subscriptions(
-        email, sub_id, extra_subs, [p.sub_base for p in configured_extras()], preserve=preserve,
+        email, sub_id, extra_subs, [p.sub_base for p in configured_extras()] + OLD_SUB_BASES, preserve=preserve,
     )
 
 
@@ -693,7 +698,8 @@ async def ensure_extras(sub: dict):
             url = f"{panel.sub_base}/{created['subId']}"
             log.info("Клиент %s на сервере «%s» создан заново при сверке", email, panel.name)
         wanted[panel.name] = url
-    if set(wanted.values()) - linked:
+    stale = any(url.startswith(old + "/") for url in linked for old in OLD_SUB_BASES)
+    if set(wanted.values()) - linked or stale:
         await _link_extras(email, sub["sub_id"], wanted)
     if missing:
         raise ExtrasOffline("не подключены серверы: " + ", ".join(missing))
