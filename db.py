@@ -140,17 +140,21 @@ def get_subscription_by_token(token):
         return dict(row) if row else None
 
 
-def mark_link_sent(discord_id, sent=True):
+def mark_link_sent(discord_id, sent=True, base=""):
     get_token(discord_id)
     with get_conn() as conn:
-        conn.execute("UPDATE tokens SET link_sent = ? WHERE discord_id = ?", (1 if sent else 0, str(discord_id)))
+        conn.execute("UPDATE tokens SET link_sent = ?, sent_base = ? WHERE discord_id = ?",
+                     (1 if sent else 0, base if sent else "", str(discord_id)))
 
 
-def list_unsent_links():
-    """Подписки, владельцам которых ещё не отправлена постоянная ссылка."""
+def list_unsent_links(base=""):
+    """Подписки, владельцам которых ещё не отправлена постоянная ссылка с адресом
+    base. Поле had_link: 1 - раньше получал ссылку с другим адресом."""
     with get_conn() as conn:
-        rows = conn.execute("SELECT s.* FROM subscriptions s LEFT JOIN tokens t ON t.discord_id = s.discord_id "
-                            "WHERE t.link_sent IS NULL OR t.link_sent = 0").fetchall()
+        rows = conn.execute(
+            "SELECT s.*, COALESCE(t.link_sent, 0) AS had_link FROM subscriptions s "
+            "LEFT JOIN tokens t ON t.discord_id = s.discord_id "
+            "WHERE t.link_sent IS NULL OR t.link_sent = 0 OR t.sent_base != ?", (base,)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -196,6 +200,9 @@ def init_db():
         _add_column(conn, "ALTER TABLE subscriptions ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS subscriptions_sub_id ON subscriptions (sub_id)")
         conn.execute(TOKENS_SCHEMA)
+        # Адрес бота, с которым человеку отправили ссылку: сменился адрес -
+        # ссылку нужно прислать заново.
+        _add_column(conn, "ALTER TABLE tokens ADD COLUMN sent_base TEXT NOT NULL DEFAULT ''")
         _backfill_events(conn)
 
 

@@ -125,6 +125,23 @@ async def test_existing_subscribers_get_new_link_once():
           f"сообщений с новой ссылкой: {len(m.dms)}")
 
 
+async def test_links_resent_when_bot_address_changes():
+    m = Member(12, V, guild=home)
+    await bot.sync_member(m)
+    m.dms.clear()
+    await bot.reconcile()
+    check(not m.dms, "ссылка отправлена повторно без причины")
+    old = bot.NEXUS_LINK_BASE
+    bot.NEXUS_LINK_BASE = "https://nexus-bot.example:8444"
+    try:
+        await bot.reconcile()
+        await bot.reconcile()
+        check(len(m.dms) == 1 and "изменился" in m.dms[0] and "https://nexus-bot.example:8444/sub/" in m.dms[0],
+              f"после смены адреса: {m.dms}")
+    finally:
+        bot.NEXUS_LINK_BASE = old
+
+
 async def test_old_add_button_leads_to_bot_link():
     m = Member(8, V, guild=home)
     await bot.sync_member(m)
@@ -167,5 +184,6 @@ async def test_up_to_20_servers_configurable():
 
 run([test_link_is_from_bot_and_has_all_servers, test_main_server_change_keeps_link_and_sends_nothing,
      test_new_server_added_to_everyone, test_server_down_keeps_its_configs, test_reissue_new_token_old_dead,
-     test_revoked_link_is_dead, test_existing_subscribers_get_new_link_once, test_old_add_button_leads_to_bot_link,
+     test_revoked_link_is_dead, test_existing_subscribers_get_new_link_once, test_links_resent_when_bot_address_changes,
+     test_old_add_button_leads_to_bot_link,
      test_retired_server, test_trial_recreated_with_same_term, test_up_to_20_servers_configurable], setup=setup)

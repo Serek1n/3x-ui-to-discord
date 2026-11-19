@@ -616,7 +616,7 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
         _checked[discord_id] = time.time()
     log.info("Выдана подписка %s пользователю %s", kind, discord_id)
     if bot_mode():
-        db.mark_link_sent(discord_id)   # ссылку человек получит в этом же сообщении
+        db.mark_link_sent(discord_id, base=NEXUS_LINK_BASE)   # ссылку человек получит в этом же сообщении
         sub_cache_forget(discord_id)
         return user_link(db.get_subscription(discord_id))
     return sub_link(created["subId"])
@@ -856,18 +856,23 @@ async def send_new_links(limit: int = 20) -> int:
     if not bot_mode():
         return 0
     sent = 0
-    for sub in db.list_unsent_links()[:limit]:
+    for sub in db.list_unsent_links(NEXUS_LINK_BASE)[:limit]:
         if sub.get("revoke_at"):
             continue
         member = find_member(int(sub["discord_id"]))
         if member is None:
             continue
         link = user_link(sub)
-        ok = await send_dm(member, "🔄 **Новая ссылка на NEXUS VPN**\n"
-                                   "Теперь все серверы - в одной подписке, и эта ссылка больше не изменится, "
-                                   "даже когда мы добавим новые страны.\n"
-                                   "Удалите старую подписку в приложении и добавьте эту:\n" + link, link)
-        db.mark_link_sent(sub["discord_id"])
+        if sub.get("had_link"):
+            text = ("🔄 **Адрес подписки NEXUS VPN изменился**\n"
+                    "Прошлая ссылка больше не работает. Удалите её в приложении и добавьте эту:\n" + link)
+        else:
+            text = ("🔄 **Новая ссылка на NEXUS VPN**\n"
+                    "Теперь все серверы - в одной подписке, и эта ссылка больше не изменится, "
+                    "даже когда мы добавим новые страны.\n"
+                    "Удалите старую подписку в приложении и добавьте эту:\n" + link)
+        ok = await send_dm(member, text, link)
+        db.mark_link_sent(sub["discord_id"], base=NEXUS_LINK_BASE)
         sent += 1 if ok else 0
         await asyncio.sleep(1)
     if sent:
@@ -1027,6 +1032,7 @@ async def reissue_link(discord_id: str):
     if bot_mode():
         sub_cache_forget(discord_id)
         db.rotate_token(discord_id)     # старая ссылка бота перестаёт работать
+        db.mark_link_sent(discord_id, base=NEXUS_LINK_BASE)   # новую человек получит в ответе
     else:
         try:
             await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
@@ -2061,7 +2067,7 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
     lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
     lines.append("**Подписка:** " + ("от бота - одна постоянная ссылка, серверы равноправны" if bot_mode()
                                       else "от основного сервера (доп. серверы - внешними ссылками)"))
-    unsent = len(db.list_unsent_links()) if bot_mode() else 0
+    unsent = len(db.list_unsent_links(NEXUS_LINK_BASE)) if bot_mode() else 0
     if unsent:
         lines.append(f"Ждут постоянную ссылку: {unsent} (бот пришлёт при сверке)")
     if _primary_suspect:
