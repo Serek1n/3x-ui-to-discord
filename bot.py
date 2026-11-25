@@ -1851,26 +1851,33 @@ async def _check_target(panel) -> str:
     return f"{host}:{port}" if host and port else panel.check_target
 
 
+async def _panel_row(panel, api) -> dict:
+    """Строка сервера для карточки по данным его панели (API /server/status)."""
+    row = {"name": panel.name, "xray": None, "rf": None, "target": await _check_target(panel)}
+    if not isinstance(api, XUIApi):
+        return row
+    try:
+        st = await api.server_status()
+        row["xray"] = str((st.get("xray") or {}).get("state", "")).lower() == "running"
+        mem = st.get("mem") or {}
+        if mem.get("total"):
+            row["mem"] = 100 * (mem.get("current") or 0) / mem["total"]
+        if st.get("cpu") is not None:
+            row["cpu"] = float(st["cpu"])
+        net = st.get("netIO") or {}
+        if net.get("down") is not None and net.get("up") is not None:
+            row["down"], row["up"] = float(net["down"]), float(net["up"])
+    except XUIError as e:
+        log.warning("Статус сервера «%s»: %s", panel.name, e)
+    return row
+
+
 async def _collect_servers() -> list:
-    """Строки серверов для карточки: Xray доп. серверов через API и
-    доступность всех серверов из РФ."""
-    servers = [{"name": primary.name, "xray": None, "rf": None, "target": await _check_target(primary)}]
-    for panel in active_extras():
-        row = {"name": panel.name, "xray": None, "rf": None, "target": await _check_target(panel)}
-        try:
-            st = await panel.api.server_status()
-            row["xray"] = str((st.get("xray") or {}).get("state", "")).lower() == "running"
-            mem = st.get("mem") or {}
-            if mem.get("total"):
-                row["mem"] = 100 * (mem.get("current") or 0) / mem["total"]
-            if st.get("cpu") is not None:
-                row["cpu"] = float(st["cpu"])
-            net = st.get("netIO") or {}
-            if net.get("down") is not None and net.get("up") is not None:
-                row["down"], row["up"] = float(net["down"]), float(net["up"])
-        except XUIError as e:
-            log.warning("Статус сервера «%s»: %s", panel.name, e)
-        servers.append(row)
+    """Строки серверов для карточки. Каждый сервер - включая основной - по
+    данным своей панели: бот может стоять на отдельной машине, и её Xray и
+    загрузка к VPN-серверам отношения не имеют. Плюс доступность из РФ."""
+    panels = [(primary, xui)] + [(p, p.api) for p in active_extras() if not p.retired]
+    servers = list(await asyncio.gather(*(_panel_row(p, api) for p, api in panels)))
     if RF_CHECK:
         targets = {sv["name"]: sv["target"] for sv in servers if sv["target"]}
         results = await rf_check.check_targets(targets) if targets else {}
@@ -1903,12 +1910,16 @@ async def status_server_cmd(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    (cpu_percent, mem, sent_speed, recv_speed, xray_running), servers = await asyncio.gather(
-        asyncio.to_thread(_sample_system_stats), _collect_servers(),
-    )
-    # Основной сервер - тот, где работает бот: его цифры меряем на месте.
-    servers[0].update(xray=xray_running, cpu=cpu_percent, mem=mem.percent,
-                      down=recv_speed, up=sent_speed)
+    if api_mode():
+        servers = await _collect_servers()
+    else:
+        # Резервный режим через браузер: статуса панели по API нет, поэтому
+        # основной сервер меряем на месте - бот должен стоять на нём же.
+        (cpu_percent, mem, sent_speed, recv_speed, xray_running), servers = await asyncio.gather(
+            asyncio.to_thread(_sample_system_stats), _collect_servers(),
+        )
+        servers[0].update(xray=xray_running, cpu=cpu_percent, mem=mem.percent,
+                          down=recv_speed, up=sent_speed)
 
     png_bytes = await asyncio.to_thread(
         _render_status_card, servers, interaction.user.display_name, await _bot_avatar(),

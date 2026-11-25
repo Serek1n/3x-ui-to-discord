@@ -20,6 +20,7 @@ class FakePanel:
         self.fail_add = 0          # сколько раз ответить 500 на add
         self.down = False          # 503 на всё
         self.inbounds = [{"id": 1, "enable": True, "protocol": "vless", "port": 443}]
+        self.xray_state = "running"
         panel = self
 
         class H(BaseHTTPRequestHandler):
@@ -68,7 +69,8 @@ class FakePanel:
                 if method == "GET" and p == "inbounds/list":
                     return ok(panel.inbounds)
                 if method == "GET" and p == "server/status":
-                    return ok({"cpu": 1, "mem": {"current": 1, "total": 4}, "xray": {"state": "running"}})
+                    return ok({"cpu": 7.5, "mem": {"current": 1, "total": 4}, "xray": {"state": panel.xray_state},
+                               "netIO": {"up": 1000, "down": 2000}})
                 if method == "GET" and p == "clients/list":
                     return ok([{"email": e} for e in panel.clients])
                 if method == "POST" and p == "clients/add":

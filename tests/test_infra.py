@@ -189,6 +189,27 @@ async def test_audit_lists_state():
     check("discord_555" not in main_p.clients, "клиент без записи не удалён по /audit")
 
 
+async def test_status_card_uses_each_panel():
+    """Статус основного сервера - по его панели, а не по машине, где запущен бот."""
+    saved = bot.RF_CHECK
+    bot.RF_CHECK = False
+    try:
+        servers = await bot._collect_servers()
+        check([sv["name"] for sv in servers] == ["Хельсинки", "Милан"], [sv["name"] for sv in servers])
+        main = servers[0]
+        check(main["xray"] is True and main["cpu"] == 7.5 and main["mem"] == 25 and main["down"] == 2000,
+              f"основной сервер не по панели: {main}")
+        main_p.xray_state = "stop"
+        servers = await bot._collect_servers()
+        check(servers[0]["xray"] is False and servers[1]["xray"] is True, "остановленный Xray не замечен")
+        main_p.down = True
+        servers = await bot._collect_servers()
+        check(servers[0]["xray"] is None, "недоступная панель показана как «не работает»")
+    finally:
+        bot.RF_CHECK = saved
+        main_p.xray_state = "running"
+
+
 async def test_scripts():
     text = open(os.path.join(REPO, "backup.sh"), encoding="utf-8").read()
     check('"${NAME}"_*.tar.gz' in text, "ротация бэкапов ищет не те файлы")
@@ -212,5 +233,5 @@ async def test_browser_errors_have_no_cookies():
 run([test_check_expired_survives_errors, test_one_bad_subscription_does_not_block_others,
      test_watchdog_reconnects_primary, test_watchdog_reconnects_extra, test_watchdog_restarts_stopped_loops,
      test_api_errors_without_secrets, test_files_restricted, test_db_backup_copy, test_rf_check_needs_enough_nodes,
-     test_rf_target_uses_vpn_port, test_audit_lists_state, test_scripts, test_browser_errors_have_no_cookies],
+     test_rf_target_uses_vpn_port, test_audit_lists_state, test_status_card_uses_each_panel, test_scripts, test_browser_errors_have_no_cookies],
     setup=setup)
