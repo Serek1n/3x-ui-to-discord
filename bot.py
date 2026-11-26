@@ -1372,8 +1372,15 @@ class ConfirmReissueView(discord.ui.View):
         else:
             await interaction.followup.send(text, file=make_qr_file(link), ephemeral=True)
         await send_dm(interaction.user, text, link)
-        await notify_admin("Старая ссылка и ключи больше не работают.", title="Ссылка перевыпущена",
-                           who=[discord_id])
+        db.log_event(discord_id, "reissue")
+        now = time.time()
+        day, month = db.count_events(discord_id, "reissue", now - 86400), \
+            db.count_events(discord_id, "reissue", now - 30 * 86400)
+        await notify_admin(
+            f"<@{discord_id}> сам нажал «Перевыпустить ссылку» в `/myvpn`. Перестала работать только "
+            f"его старая ссылка, у остальных подписчиков ничего не изменилось.",
+            title="Пользователь сменил свою ссылку", level="warn" if day >= 3 else "info",
+            fields=[("За сутки", day), ("За 30 дней", month)])
 
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):

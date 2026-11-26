@@ -94,6 +94,36 @@ async def test_manual_links_survive_reissue():
     check("https://other.example/y" in main_p.linked("discord_6"), "ручная ссылка потеряна при перевыпуске")
 
 
+async def test_admin_sees_user_changed_own_link():
+    """Оповещение говорит, что ссылку сменил сам пользователь, и сколько раз."""
+    m = Member(7, V, guild=home)
+    await bot.sync_member(m)
+    admin.clear()
+
+    class Resp:
+        async def edit_message(self, **kw):
+            pass
+
+    class Follow:
+        async def send(self, *a, **kw):
+            pass
+
+    class I:
+        user = m
+        response = Resp()
+        followup = Follow()
+    view = bot.ConfirmReissueView(7)
+    bot._reissue_times.clear()
+    await view.confirm.callback(I())
+    bot._reissue_times.clear()
+    await view.confirm.callback(I())
+    texts = [t for t in admin if "сменил свою ссылку" in t]
+    check(len(texts) == 2, f"оповещения: {admin}")
+    check("<@7> сам нажал" in texts[-1] and "у остальных подписчиков ничего не изменилось" in texts[-1], texts[-1])
+    check("За сутки: 2" in texts[-1], f"нет счётчика: {texts[-1]}")
+
+
 run([test_reissue_changes_keys_everywhere, test_reissue_survives_one_add_failure,
      test_reissue_total_failure_is_restored, test_reissue_extra_down_replaced_later,
-     test_trial_reissue_keeps_remaining_time, test_manual_links_survive_reissue], setup=setup)
+     test_trial_reissue_keeps_remaining_time, test_manual_links_survive_reissue,
+     test_admin_sees_user_changed_own_link], setup=setup)

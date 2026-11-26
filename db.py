@@ -407,6 +407,12 @@ def log_event(discord_id, kind, source="", detail="", ts=None):
         )
 
 
+def count_events(discord_id, kind, since_ts):
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM events WHERE discord_id = ? AND kind = ? AND ts >= ?",
+                            (str(discord_id), kind, int(since_ts))).fetchone()[0]
+
+
 def paid_by_source():
     with get_conn() as conn:
         rows = conn.execute(
