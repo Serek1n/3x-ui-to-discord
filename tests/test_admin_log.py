@@ -100,6 +100,17 @@ async def test_underscores_not_italic():
     check("XUI\\_WEB\\_BASE\\_PATH" in e.fields[0].value, e.fields[0].value)
 
 
+async def test_single_card_shows_who():
+    """Одиночная карточка тоже показывает, кого она касается."""
+    lg = new_log()
+    lg.post("Старая ссылка и ключи больше не работают.", title="Ссылка перевыпущена", who=["123456789012345678"])
+    lg.post("Для <@223456789012345678> что-то", title="Другое", who=["223456789012345678"])
+    await wait()
+    a, b = sent[0]
+    check("**Кто:** <@123456789012345678>" in a.description, a.description)
+    check(b.description.count("223456789012345678") == 1, f"человек указан дважды: {b.description}")
+
+
 async def test_guild_id_is_not_mention():
     lg = new_log()
     lg.post("«evil» (`123456789012345678`)", title="Чужой сервер")
@@ -240,5 +251,5 @@ async def test_watchdog_reports_state_changes_only():
 run([test_dm_to_owner_by_default, test_dm_to_listed_admins, test_closed_dm_falls_back_to_channel,
      test_dm_mode_does_not_duplicate_to_channel, test_names_instead_of_mentions,
      test_card_has_level_title_and_mention, test_similar_messages_are_merged, test_auto_ids_merged,
-     test_many_cards_split_by_ten, test_cooldown_by_key, test_fields_and_long_text, test_underscores_not_italic, test_guild_id_is_not_mention,
+     test_many_cards_split_by_ten, test_cooldown_by_key, test_fields_and_long_text, test_underscores_not_italic, test_single_card_shows_who, test_guild_id_is_not_mention,
      test_offline_extra_not_reported_per_member, test_watchdog_reports_state_changes_only])

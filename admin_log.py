@@ -204,6 +204,13 @@ class AdminLog:
             title = f"{title} ×{n}"
         if n == 1:
             desc = self._names(first.text)
+            # Кого касается - если в тексте этого человека ещё нет.
+            shown = set(_ID.findall(first.text))
+            extra = [w for w in first.who if w not in shown]
+            if extra:
+                label = "Кто" if len(extra) == 1 else "Кого касается"
+                desc = (desc + "\n\n" if desc else "") + f"**{label}:** " + ", ".join(
+                    self.name(w) for w in extra[:15])
         else:
             who = list(dict.fromkeys(w for it in group for w in it.who))
             desc = _strip_ids(first.text)
