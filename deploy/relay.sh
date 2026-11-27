@@ -30,8 +30,16 @@ if [ "${1:-}" = "--remove" ]; then
   exit 0
 fi
 
-BOT_IP="${1:-}"
-PORT="${2:-8444}"
+# Пропускаем «--» и тире, в которые телефоны и мессенджеры превращают «--».
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --|-|–|—|−) ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+BOT_IP="${ARGS[0]:-}"
+PORT="${ARGS[1]:-8444}"
 
 if ! [[ "$BOT_IP" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   echo "Укажите IP или домен сервера с ботом (не домен подписки - он будет указывать сюда):" >&2
@@ -42,12 +50,23 @@ if ! [[ "$BOT_IP" =~ ^[0-9.]+$ ]]; then
   echo "!! Адрес бота задан доменом ($BOT_IP). Это не должен быть домен подписки из NEXUS_LINK_BASE:"
   echo "!! при блокировке он будет указывать на эту точку, и запросы пойдут по кругу."
 fi
+# Точка входа на самом сервере бота бесполезна: если его IP заблокируют, она
+# заблокирована вместе с ним.
+TARGET_IP="$BOT_IP"
+if ! [[ "$BOT_IP" =~ ^[0-9.]+$ ]]; then
+  TARGET_IP="$(getent ahostsv4 "$BOT_IP" | awk 'NR==1{print $1}')"
+fi
+if [ -n "$TARGET_IP" ] && { hostname -I | tr ' ' '\n' | grep -qx "$TARGET_IP" || [ "$TARGET_IP" = "127.0.0.1" ]; }; then
+  echo "Это сервер с ботом ($TARGET_IP). Точку входа ставят на ДРУГИЕ серверы (VPN-серверы)," >&2
+  echo "а адрес в команде - IP этого сервера с ботом." >&2
+  exit 1
+fi
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   echo "Неверный порт: $PORT" >&2
   exit 1
 fi
 
-if ss -ltn "( sport = :$PORT )" | grep -q LISTEN && ! systemctl is-active --quiet "$SERVICE"; then
+if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$PORT )" | grep -q LISTEN && ! systemctl is-active --quiet "$SERVICE"; then
   echo "Порт $PORT на этом сервере уже занят другой программой:" >&2
   ss -ltnp "( sport = :$PORT )" >&2
   echo "Освободите его или укажите другой порт (тогда и в NEXUS_LINK_BASE бота нужен этот же порт)." >&2
