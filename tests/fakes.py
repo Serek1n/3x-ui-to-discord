@@ -44,8 +44,15 @@ class FakePanel:
                 if method == "GET" and path.startswith("/subsrv/"):
                     # Сервис подписок 3x-ui: без токена, base64 со ссылками.
                     sid = path[len("/subsrv/"):]
-                    links = [f"vless://{c['uuid']}@{panel.host}:443?type=tcp&security=reality#{c['email']}"
-                             for c in panel.clients.values() if c["subId"] == sid]
+                    links = []
+                    for c in panel.clients.values():
+                        if c["subId"] != sid:
+                            continue
+                        links.append(panel.own_link(c))
+                        # Как 3x-ui: внешние ссылки вида «link» добавляются как есть (имя - remark).
+                        for ext in panel.links.get(c["email"], []):
+                            if ext.get("kind") == "link":
+                                links.append(ext["value"].split("#")[0] + "#" + (ext.get("remark") or ""))
                     if not links:
                         return self._send(404, None, raw=b"")
                     import base64
@@ -84,6 +91,9 @@ class FakePanel:
                         return fail("exists")
                     panel.clients[c["email"]] = c
                     return ok()
+                if method == "GET" and p.startswith("clients/links/"):
+                    c = panel.clients.get(unquote(p[len("clients/links/"):]))
+                    return ok([panel.own_link(c)] if c else [])
                 if method == "GET" and p.startswith("clients/traffic/"):
                     email = unquote(p[len("clients/traffic/"):])
                     if panel.fail_traffic > 0:
@@ -120,6 +130,9 @@ class FakePanel:
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def own_link(self, c):
+        return f"vless://{c['uuid']}@{self.host}:443?type=tcp&security=reality#{c['email']}"
 
     def linked(self, email):
         return {link["value"] for link in self.links.get(email, [])}

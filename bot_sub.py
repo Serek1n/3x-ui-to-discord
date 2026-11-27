@@ -105,7 +105,12 @@ class SubAggregator:
         key = (name, email)
         if url:
             try:
-                links, info = await self._fetch(url, verify)
+                if callable(url):   # конфиги получены не по ссылке подписки, а напрямую (API панели)
+                    links, info = await url(), {}
+                    if not links:
+                        raise ValueError("нет конфигов")
+                else:
+                    links, info = await self._fetch(url, verify)
                 self._last_good[key] = (time.time(), links, info)
                 return name, links, info
             except Exception as e:

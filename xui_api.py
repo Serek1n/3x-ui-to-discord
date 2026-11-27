@@ -28,6 +28,8 @@ from xui_client import XUIError
 
 log = logging.getLogger("xui.api")
 
+# Пометка наших внешних ссылок-конфигов (чтобы не трогать ручные ссылки админа)
+MIRROR_MARK = "nexus-bot"
 DAY_MS = 86_400_000
 
 
@@ -210,17 +212,18 @@ class XUIApi:
 
     async def add_client(self, inbound_id: int, email: str, days: int, total_gb: int = 0,
                           ip_limit: int = 0, auto_renew_days: int = 0, *,
-                          expiry_time: int | None = None, comment: str = ""):
+                          expiry_time: int | None = None, comment: str = "", sub_id: str | None = None):
         """Создаёт клиента. days>0 - срок с первого подключения (expiryTime < 0).
         expiry_time задаёт expiryTime напрямую (мс; <0 - длительность от первого
-        подключения). Если клиент с таким email уже есть - он пересоздаётся."""
+        подключения). Если клиент с таким email уже есть - он пересоздаётся.
+        sub_id - свой subId (одинаковый на всех серверах = постоянные ссылки)."""
         if await self.find_client(email):
             log.info("[%s] клиент %s уже есть - удаляю перед созданием", self.name, email)
             await self.delete_client(inbound_id, "", email=email)
 
         if expiry_time is None:
             expiry_time = -days * DAY_MS if days > 0 else 0
-        sub_id = gen_sub_id()
+        sub_id = sub_id or gen_sub_id()
         client = {
             "email": email,
             "enable": True,
@@ -309,6 +312,35 @@ class XUIApi:
             keep.append({"kind": "subscription", "value": url, "remark": remark,
                          "enable": True, "expiryTime": 0, "namePrefix": ""})
         await self._req("POST", f"/panel/api/clients/{_q(email)}/externalLinks", {"externalLinks": keep})
+
+    async def client_links(self, email: str) -> list:
+        """Собственные конфиги клиента на этом сервере (без внешних ссылок)."""
+        data = await self._req("GET", f"/panel/api/clients/links/{_q(email)}")
+        return [x.strip() for x in (data.get("obj") or []) if isinstance(x, str) and "://" in x]
+
+    async def set_mirror_configs(self, email: str, sub_id: str, configs: list, drop_prefixes=()) -> bool:
+        """Прописывает клиенту готовые конфиги других серверов (внешние ссылки
+        вида «link»), чтобы подписка этого сервера отдавала все страны.
+        configs: [(название, ссылка)]. Наши ссылки помечены namePrefix=MIRROR_MARK;
+        ручные ссылки админа сохраняются; внешние подписки наших серверов
+        (прежняя схема) убираются. Возвращает True, если что-то изменилось."""
+        current = await self.get_external_links(email, sub_id)
+        keep = []
+        for link in current:
+            value = str(link.get("value") or "")
+            if link.get("namePrefix") == MIRROR_MARK:
+                continue
+            if link.get("kind") == "subscription" and any(value.startswith(p) for p in drop_prefixes if p):
+                continue
+            keep.append({k: link[k] for k in ("kind", "value", "remark", "enable", "expiryTime", "namePrefix")
+                         if k in link})
+        wanted = keep + [{"kind": "link", "value": uri, "remark": remark, "enable": True, "expiryTime": 0,
+                          "namePrefix": MIRROR_MARK} for remark, uri in configs]
+        sig = lambda links: [(x.get("kind"), x.get("value"), x.get("remark") or "") for x in links]
+        if sig(wanted) == sig(current):
+            return False
+        await self._req("POST", f"/panel/api/clients/{_q(email)}/externalLinks", {"externalLinks": wanted})
+        return True
 
     async def has_external_links(self, email: str, sub_id: str, urls: list) -> bool:
         values = {str(link.get("value") or "") for link in await self.get_external_links(email, sub_id)}

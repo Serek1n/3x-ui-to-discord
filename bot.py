@@ -66,7 +66,7 @@ from xui_client import XUIClient, XUIError  # noqa: E402
 from xui_api import XUIApi, recent_ips  # noqa: E402
 import rf_check  # noqa: E402
 from link_server import LinkServer  # noqa: E402
-from bot_sub import SubAggregator  # noqa: E402
+from bot_sub import SubAggregator, rename as sub_rename  # noqa: E402
 from sub_guard import SubGuard  # noqa: E402
 from admin_log import AdminLog  # noqa: E402
 
@@ -192,6 +192,11 @@ BOT_SUBSCRIPTION = _env_bool("BOT_SUBSCRIPTION", "false")
 SUB_TITLE = _env("SUB_TITLE", "NEXUS VPN")
 SUB_RENAME_CONFIGS = _env_bool("SUB_RENAME_CONFIGS", "true")   # конфиги называются как серверы
 SUB_UPDATE_HOURS = _env_int("SUB_UPDATE_HOURS", "12")
+# Ссылка на каждый сервер: у человека постоянная ссылка подписки на каждом сервере
+# (адрес подписок сервера/токен), и каждая отдаёт ВСЕ страны - бот прописывает в
+# панели готовые конфиги остальных серверов. Заблокировали IP одного сервера -
+# работают ссылки остальных.
+SUB_PER_SERVER = _env_bool("SUB_PER_SERVER", "false")
 # Защита адреса подписки от блокировки IP в РФ (см. sub_guard.py):
 # SUB_RELAYS - IP запасных точек входа (deploy/relay.sh на VPN-серверах), через запятую;
 # DUCKDNS_TOKEN - чтобы бот сам переключал домен из NEXUS_LINK_BASE на доступную точку.
@@ -316,6 +321,16 @@ def serving_extras() -> list:
     return [p for p in configured_extras() if not p.retired]
 
 
+def per_server_mode() -> bool:
+    """Ссылка на каждый сервер, в каждой все страны (нужен API-токен)."""
+    return SUB_PER_SERVER and api_mode()
+
+
+def links_signature() -> str:
+    """Какой набор ссылок выдан человеку: сменился - бот один раз пришлёт новые."""
+    return (NEXUS_LINK_BASE if bot_mode() else "") + ("|per-server" if per_server_mode() else "")
+
+
 def bot_mode() -> bool:
     """Подписку выдаёт бот (нужны BOT_SUBSCRIPTION=true, NEXUS_LINK_BASE и API-токен)."""
     return BOT_SUBSCRIPTION and bool(NEXUS_LINK_BASE) and api_mode()
@@ -370,13 +385,39 @@ def plain_sub_url(sub_id: str) -> str:
 
 def link_id(sub: dict) -> str:
     """То, что стоит в конце ссылки: токен бота или subId основного сервера."""
-    return db.get_token(sub["discord_id"]) if bot_mode() else sub["sub_id"]
+    return db.get_token(sub["discord_id"]) if (bot_mode() or per_server_mode()) else sub["sub_id"]
+
+
+def all_links(sub: dict) -> list:
+    """[(название, ссылка)] - все ссылки человека, первая - основная."""
+    token = db.get_token(sub["discord_id"])
+    out = []
+    if bot_mode():
+        out.append((SUB_TITLE, f"{NEXUS_LINK_BASE}/sub/{token}"))
+    if per_server_mode():
+        out += [(p.name, f"{p.sub_base}/{token}") for p in [primary] + serving_extras()]
+    if not out:
+        out.append((primary.name, plain_sub_url(sub["sub_id"])))
+    return out
 
 
 def plain_user_url(sub: dict) -> str:
-    if bot_mode():
-        return f"{NEXUS_LINK_BASE}/sub/{db.get_token(sub['discord_id'])}"
-    return plain_sub_url(sub["sub_id"])
+    return all_links(sub)[0][1]
+
+
+def extra_links_text(link: str) -> str:
+    """Запасные ссылки к сообщению с основной ссылкой (режим SUB_PER_SERVER)."""
+    if not per_server_mode() or not link:
+        return ""
+    token = link.split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    sub = db.get_subscription_by_token(token)
+    if sub is None:
+        return ""
+    rest = all_links(sub)[1:]
+    if not rest:
+        return ""
+    return ("\n\n**Запасные ссылки** - в каждой все серверы. Если основная перестала обновляться, "
+            "добавьте в приложение любую из них:\n" + "\n".join(f"• {name}: {url}" for name, url in rest))
 
 
 def user_link(sub: dict) -> str:
@@ -508,6 +549,8 @@ def find_member(user_id: int):
 async def send_dm(user, text: str, link: str | None = None):
     """Пишет пользователю в ЛС (с QR-кодом, если передана ссылка). Закрытые
     ЛС не считаются ошибкой."""
+    if link:
+        text += extra_links_text(link)
     try:
         if link:
             view = nexus_view(link)
@@ -575,7 +618,7 @@ async def _link_extras(email: str, sub_id: str, extra_subs: dict, preserve: list
     )
 
 
-async def _create_on_extras(email: str, expiry_time: int, comment: str):
+async def _create_on_extras(email: str, expiry_time: int, comment: str, sub_id: str | None = None):
     """Создаёт клиента на всех доп. серверах. Возвращает ({название: url подписки},
     [серверы, где не получилось]). Ошибка на одном сервере не мешает выдаче:
     сверка досоздаст клиента позже (см. ensure_extras)."""
@@ -586,7 +629,7 @@ async def _create_on_extras(email: str, expiry_time: int, comment: str):
             continue
         try:
             created = await panel.api.add_client(
-                0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time, comment=comment,
+                0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time, comment=comment, sub_id=sub_id,
             )
             subs[panel.name] = f"{panel.sub_base}/{created['subId']}"
         except XUIError as e:
@@ -604,10 +647,11 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
     failed = []
     if api_mode():
         expiry_time = -TRIAL_DAYS * 86_400_000 if kind == "trial" else 0
+        fixed = db.get_token(discord_id) if per_server_mode() else None
         created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT,
-                                       expiry_time=expiry_time, comment=comment)
-        extra_subs, failed = await _create_on_extras(email, expiry_time, comment)
-        if not bot_mode():   # в режиме бота подписку собирает бот, внешние ссылки не нужны
+                                       expiry_time=expiry_time, comment=comment, sub_id=fixed)
+        extra_subs, failed = await _create_on_extras(email, expiry_time, comment, sub_id=fixed)
+        if not (bot_mode() or per_server_mode()):   # подписку собирает бот / зеркала - внешние подписки не нужны
             try:
                 await _link_extras(email, created["subId"], extra_subs)
             except XUIError as e:
@@ -628,8 +672,14 @@ async def _create_sub(discord_id: str, kind: str, *, member=None, source: str = 
     else:
         _checked[discord_id] = time.time()
     log.info("Выдана подписка %s пользователю %s", kind, discord_id)
-    if bot_mode():
-        db.mark_link_sent(discord_id, base=NEXUS_LINK_BASE)   # ссылку человек получит в этом же сообщении
+    if per_server_mode():
+        try:
+            await sync_mirrors(db.get_subscription(discord_id))
+        except XUIError as e:
+            _checked.pop(discord_id, None)   # сверка допропишет конфиги
+            log.warning("Конфиги других серверов для %s не прописаны: %s", email, e)
+    if bot_mode() or per_server_mode():
+        db.mark_link_sent(discord_id, base=links_signature())   # ссылки человек получит в этом же сообщении
         sub_cache_forget(discord_id)
         return user_link(db.get_subscription(discord_id))
     return sub_link(created["subId"])
@@ -803,18 +853,21 @@ async def ensure_all_servers(sub: dict):
     (основной - такой же, как остальные). Чего нет - создаётся."""
     did, email = sub["discord_id"], sub["email"]
     expiry_time, missing, created_any = None, [], False
+    want = db.get_token(did) if per_server_mode() else None   # одинаковый subId = постоянные ссылки
     for panel in [primary] + serving_extras():
         api = xui if panel is primary else panel.api
         if api is None:
             missing.append(panel.name)
             continue
         found = await _lookup(api, email)
-        if found is None:
+        if found is None or (want and isinstance(found, dict) and found.get("subId") != want):
             if expiry_time is None:
                 expiry_time = await _expiry_for_new_client(sub)
-            found = await api.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time)
+            why = "нет на сервере" if found is None else "переход на постоянные ссылки"
+            found = await api.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time,
+                                         sub_id=want)
             created_any = True
-            log.info("Клиент %s создан на сервере «%s» при сверке", email, panel.name)
+            log.info("Клиент %s создан на сервере «%s» при сверке (%s)", email, panel.name, why)
         if panel is primary and isinstance(found, dict):
             sid, uid = found.get("subId"), found.get("uuid") or found.get("id")
             if sid and sid != sub["sub_id"]:
@@ -834,7 +887,10 @@ async def _sub_sources(sub: dict) -> list:
         api = xui if panel is primary else panel.api
         verify = XUI_VERIFY_SSL if panel is primary else panel.env.get("verify_ssl", True)
         url = None
-        if api is not None:
+        if api is not None and per_server_mode():
+            # Подписка сервера отдаёт и конфиги остальных - берём только его собственные.
+            url = (lambda a=api: a.client_links(sub["email"]))
+        elif api is not None:
             try:
                 found = await _lookup(api, sub["email"])
                 if isinstance(found, dict) and found.get("subId"):
@@ -863,20 +919,60 @@ def sub_cache_forget(discord_id: str, email: str = None):
     sub_aggregator.forget(token=token, email=email)
 
 
+_mirrors_ok: set = set()   # у кого конфиги всех серверов прописаны во все панели
+
+
+async def sync_mirrors(sub: dict):
+    """Режим SUB_PER_SERVER: в каждую панель прописывает клиенту готовые конфиги
+    остальных серверов, чтобы ссылка любого сервера отдавала все страны.
+    Если какой-то сервер не ответил - ничего не трогаем (иначе его страна
+    пропала бы из ссылок остальных)."""
+    did, email = sub["discord_id"], sub["email"]
+    token = db.get_token(did)
+    panels = [(primary, xui)] + [(p, p.api) for p in serving_extras()]
+    offline = [p.name for p, api in panels if api is None]
+    if offline:
+        raise ExtrasOffline("не подключены серверы: " + ", ".join(offline))
+    own = {}
+    for p, api in panels:
+        own[p.name] = await api.client_links(email)
+    drop = [p.sub_base for p, _ in panels] + OLD_SUB_BASES
+    changed = False
+    for p, api in panels:
+        configs = []
+        for q, _ in panels:
+            if q is p:
+                continue
+            links = own[q.name]
+            for i, uri in enumerate(links, 1):
+                name = q.name if len(links) == 1 else f"{q.name} {i}"
+                configs.append((name, sub_rename(uri, name)))
+        changed |= await api.set_mirror_configs(email, token, configs, drop_prefixes=drop)
+    _mirrors_ok.add(did)
+    if changed:
+        log.info("Конфиги всех серверов прописаны в подписки %s", email)
+
+
 async def send_new_links(limit: int = 20) -> int:
-    """Переход на ссылку от бота: один раз присылает постоянную ссылку тем, кто
-    её ещё не получал (старая ссылка работает, пока жив её сервер)."""
-    if not bot_mode():
+    """Переход на новые ссылки (от бота или на каждый сервер): один раз присылает
+    их тем, кто ещё не получал (старая ссылка работает, пока жив её сервер)."""
+    if not (bot_mode() or per_server_mode()):
         return 0
-    sent = 0
-    for sub in db.list_unsent_links(NEXUS_LINK_BASE)[:limit]:
+    sent, sig = 0, links_signature()
+    for sub in db.list_unsent_links(sig)[:limit]:
         if sub.get("revoke_at"):
             continue
+        if per_server_mode() and sub["discord_id"] not in _mirrors_ok:
+            continue   # сначала клиенты на всех серверах и конфиги, потом сообщение
         member = find_member(int(sub["discord_id"]))
         if member is None:
             continue
         link = user_link(sub)
-        if sub.get("had_link"):
+        if per_server_mode():
+            text = ("🔄 **Ссылки на NEXUS VPN**\n"
+                    "Теперь у вашей подписки несколько ссылок, и в каждой - все серверы. Если какую-то "
+                    "заблокируют, остальные продолжат работать. Добавьте в приложение основную:\n" + link)
+        elif sub.get("had_link"):
             text = ("🔄 **Адрес подписки NEXUS VPN изменился**\n"
                     "Прошлая ссылка больше не работает. Удалите её в приложении и добавьте эту:\n" + link)
         else:
@@ -885,11 +981,11 @@ async def send_new_links(limit: int = 20) -> int:
                     "даже когда мы добавим новые страны.\n"
                     "Удалите старую подписку в приложении и добавьте эту:\n" + link)
         ok = await send_dm(member, text, link)
-        db.mark_link_sent(sub["discord_id"], base=NEXUS_LINK_BASE)
+        db.mark_link_sent(sub["discord_id"], base=sig)
         sent += 1 if ok else 0
         await asyncio.sleep(1)
     if sent:
-        await notify_admin(f"Новая постоянная ссылка отправлена {sent} подписчикам.", title="Переход на ссылку от бота")
+        await notify_admin(f"Новые ссылки отправлены {sent} подписчикам.", title="Переход на новые ссылки")
     return sent
 
 
@@ -904,7 +1000,7 @@ async def check_primary_panel() -> bool:
     """Сравнивает случайные подписки из базы с основной панелью: у настоящей
     основной панели клиенты есть и subId совпадают. True - всё в порядке."""
     global _primary_suspect
-    if bot_mode():
+    if bot_mode() or per_server_mode():
         _primary_suspect = False   # ссылки не зависят от основной панели
         return True
     subs = db.list_subscriptions()
@@ -949,10 +1045,12 @@ async def ensure_consistent(member, sub: dict, *, force: bool = False) -> bool:
     did = sub["discord_id"]
     if xui is None or (not force and time.time() - _checked.get(did, 0) < CHECK_TTL):
         return False
-    if bot_mode():
-        # Ссылка у человека от бота и от серверов не зависит: недостающих клиентов
-        # просто создаём на всех серверах, без новых ссылок и сообщений.
+    if bot_mode() or per_server_mode():
+        # Ссылки у человека от серверов не зависят (токен бота / одинаковый subId):
+        # недостающих клиентов просто создаём, без новых ссылок и сообщений.
         await ensure_all_servers(sub)
+        if per_server_mode():
+            await sync_mirrors(db.get_subscription(did) or sub)
         _checked[did] = time.time()
         return False
     if _primary_suspect is not False and api_mode():
@@ -1029,10 +1127,16 @@ async def reissue_link(discord_id: str):
     old_links = await xui.get_external_links(email, sub["sub_id"])
     # add_client сам удаляет старого клиента с тем же email и создаёт нового.
     # Между удалением и созданием панель может сбойнуть - повторяем.
+    # Ссылки на каждый сервер: новый токен = новый subId на всех серверах.
+    fixed = None
+    if per_server_mode():
+        sub_cache_forget(discord_id)
+        fixed = db.rotate_token(discord_id)
     created, last = None, None
     for attempt in range(3):
         try:
-            created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time)
+            created = await xui.add_client(0, email, 0, ip_limit=DEVICE_LIMIT, expiry_time=expiry_time,
+                                           sub_id=fixed)
             break
         except XUIError as e:
             last = e
@@ -1041,11 +1145,18 @@ async def reissue_link(discord_id: str):
         _checked.pop(discord_id, None)   # ближайшая сверка восстановит клиента
         raise last
     db.update_client_ids(discord_id, created["uuid"], created["subId"])
-    extra_subs, failed = await _create_on_extras(email, expiry_time, "")
-    if bot_mode():
+    extra_subs, failed = await _create_on_extras(email, expiry_time, "", sub_id=fixed)
+    if per_server_mode():
+        try:
+            await sync_mirrors(db.get_subscription(discord_id))
+        except XUIError as e:
+            log.warning("Перевыпуск %s: конфиги других серверов пропишет сверка: %s", email, e)
+            _checked.pop(discord_id, None)
+        db.mark_link_sent(discord_id, base=links_signature())
+    elif bot_mode():
         sub_cache_forget(discord_id)
         db.rotate_token(discord_id)     # старая ссылка бота перестаёт работать
-        db.mark_link_sent(discord_id, base=NEXUS_LINK_BASE)   # новую человек получит в ответе
+        db.mark_link_sent(discord_id, base=links_signature())   # новую человек получит в ответе
     else:
         try:
             await _link_extras(email, created["subId"], extra_subs, preserve=old_links)
@@ -1060,7 +1171,7 @@ async def reissue_link(discord_id: str):
     else:
         _checked[discord_id] = time.time()
     log.info("Перевыпущена ссылка пользователя %s", discord_id)
-    if bot_mode():
+    if bot_mode() or per_server_mode():
         return user_link(db.get_subscription(discord_id)), failed
     return sub_link(created["subId"]), [f for f in failed if f != "внешние ссылки"]
 
@@ -1372,7 +1483,7 @@ class ConfirmReissueView(discord.ui.View):
             return
         _reissue_times[self.owner_id] = now
         text = ("Ссылка перевыпущена ✅ Старая и все добавленные по ней конфиги больше не работают.\n"
-                f"Добавьте новую подписку в приложение заново:\n{link}")
+                f"Добавьте новую подписку в приложение заново:\n{link}") + extra_links_text(link)
         if failed:
             text += ("\n\n⚠️ Серверы " + ", ".join(failed) + " сейчас недоступны - они появятся в подписке "
                      "автоматически, когда снова заработают (обновите подписку в приложении позже).")
@@ -1477,7 +1588,7 @@ async def myvpn(interaction: discord.Interaction):
         lines.append(f"Использовано: ↑{traffic[0] / 1024 ** 3:.2f} ГБ / ↓{traffic[1] / 1024 ** 3:.2f} ГБ")
 
     link = user_link(sub)
-    lines.append(f"Ссылка: {link}")
+    lines.append(f"Ссылка: {link}" + extra_links_text(link))
     await interaction.followup.send(
         "\n".join(lines),
         file=make_qr_file(link),
@@ -2096,8 +2207,16 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
         return
     await interaction.response.defer(ephemeral=True)
     lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
-    lines.append("**Подписка:** " + ("от бота - одна постоянная ссылка, серверы равноправны" if bot_mode()
-                                      else "от основного сервера (доп. серверы - внешними ссылками)"))
+    kinds = []
+    if bot_mode():
+        kinds.append("от бота (одна постоянная ссылка)")
+    if per_server_mode():
+        kinds.append("ссылка на каждый сервер, в каждой все страны")
+    lines.append("**Подписка:** " + (" + ".join(kinds) or "от основного сервера (доп. серверы - внешними ссылками)"))
+    if per_server_mode():
+        waiting = len(db.list_subscriptions()) - len(_mirrors_ok)
+        if waiting > 0:
+            lines.append(f"Конфиги всех серверов ещё не прописаны у {waiting} подписчиков (сделает сверка)")
     if sub_guard is not None:
         st = sub_guard.last
         state = {"ok": "✅ открывается из РФ", "partial": "🟠 частично из РФ", "blocked": "🔴 заблокирован в РФ"}.get(
@@ -2106,7 +2225,7 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
                 else "переключать некуда - задайте SUB_RELAYS и DUCKDNS_TOKEN")
         lines.append(f"**Адрес подписки:** {sub_guard.host} → {st.get('ip', '?')}, {state}; запасных точек: "
                      f"{len(sub_guard.relays)}, {mode}")
-    unsent = len(db.list_unsent_links(NEXUS_LINK_BASE)) if bot_mode() else 0
+    unsent = len(db.list_unsent_links(links_signature())) if (bot_mode() or per_server_mode()) else 0
     if unsent:
         lines.append(f"Ждут постоянную ссылку: {unsent} (бот пришлёт при сверке)")
     if _primary_suspect:
@@ -2723,7 +2842,7 @@ async def reconcile(force_check: bool = False) -> Counter:
             except XUIError as e:
                 log.warning("Поиск клиентов без записи в базе: %s", e)
 
-    if bot_mode():
+    if bot_mode() or per_server_mode():
         try:
             await send_new_links()
         except Exception:
