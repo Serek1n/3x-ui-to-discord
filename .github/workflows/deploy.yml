@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m py_compile *.py
           python -m pyflakes *.py tests/*.py
-          bash -n deploy.sh backup.sh install_ubuntu.sh
+          bash -n deploy.sh backup.sh install_ubuntu.sh deploy/relay.sh
 
       - name: Тесты
         run: python tests/run_all.py

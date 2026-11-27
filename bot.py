@@ -48,6 +48,9 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 
+from urllib.parse import urlparse
+
+import httpx
 import psutil
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -64,6 +67,7 @@ from xui_api import XUIApi, recent_ips  # noqa: E402
 import rf_check  # noqa: E402
 from link_server import LinkServer  # noqa: E402
 from bot_sub import SubAggregator  # noqa: E402
+from sub_guard import SubGuard  # noqa: E402
 from admin_log import AdminLog  # noqa: E402
 
 log = logging.getLogger("nexus")
@@ -188,6 +192,13 @@ BOT_SUBSCRIPTION = _env_bool("BOT_SUBSCRIPTION", "false")
 SUB_TITLE = _env("SUB_TITLE", "NEXUS VPN")
 SUB_RENAME_CONFIGS = _env_bool("SUB_RENAME_CONFIGS", "true")   # конфиги называются как серверы
 SUB_UPDATE_HOURS = _env_int("SUB_UPDATE_HOURS", "12")
+# Защита адреса подписки от блокировки IP в РФ (см. sub_guard.py):
+# SUB_RELAYS - IP запасных точек входа (deploy/relay.sh на VPN-серверах), через запятую;
+# DUCKDNS_TOKEN - чтобы бот сам переключал домен из NEXUS_LINK_BASE на доступную точку.
+SUB_RELAYS = [x for x in re.split(r"[\s,;]+", _env("SUB_RELAYS")) if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", x)]
+DUCKDNS_TOKEN = _env("DUCKDNS_TOKEN", "")
+BOT_PUBLIC_IP = _env("BOT_PUBLIC_IP", "")
+SUB_GUARD_MINUTES = _env_int("SUB_GUARD_MINUTES", "15")
 NEXUS_LINK_HOST = _env("NEXUS_LINK_HOST", "0.0.0.0")
 NEXUS_LINK_PORT = _env_int("NEXUS_LINK_PORT", "8444")
 # Сертификат и ключ (те же файлы, что у панели 3x-ui). Без них переходник
@@ -2085,6 +2096,14 @@ async def audit_cmd(interaction: discord.Interaction, delete_orphans: bool = Fal
     lines = [f"**Основная панель «{primary.name}»:** " + ("✅ подключена" if xui is not None else "🔴 не подключена")]
     lines.append("**Подписка:** " + ("от бота - одна постоянная ссылка, серверы равноправны" if bot_mode()
                                       else "от основного сервера (доп. серверы - внешними ссылками)"))
+    if sub_guard is not None:
+        st = sub_guard.last
+        state = {"ok": "✅ открывается из РФ", "partial": "🟠 частично из РФ", "blocked": "🔴 заблокирован в РФ"}.get(
+            st.get("status"), "проверка ещё не проводилась")
+        mode = ("переключение автоматическое" if sub_guard.can_switch
+                else "переключать некуда - задайте SUB_RELAYS и DUCKDNS_TOKEN")
+        lines.append(f"**Адрес подписки:** {sub_guard.host} → {st.get('ip', '?')}, {state}; запасных точек: "
+                     f"{len(sub_guard.relays)}, {mode}")
     unsent = len(db.list_unsent_links(NEXUS_LINK_BASE)) if bot_mode() else 0
     if unsent:
         lines.append(f"Ждут постоянную ссылку: {unsent} (бот пришлёт при сверке)")
@@ -2847,6 +2866,48 @@ async def check_expired():
         log.exception("Ошибка в check_expired")
 
 
+# ---------- защита адреса подписки ----------
+
+sub_guard = None
+
+
+async def _public_ip() -> str:
+    if BOT_PUBLIC_IP:
+        return BOT_PUBLIC_IP
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            ip = (await http.get("https://api.ipify.org")).text.strip()
+        return ip if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip) else ""
+    except httpx.HTTPError as e:
+        log.warning("Не удалось узнать свой IP: %s", e)
+        return ""
+
+
+async def make_sub_guard():
+    """Включается в режиме подписки от бота, если включена проверка из РФ."""
+    if not (bot_mode() and RF_CHECK and SUB_GUARD_MINUTES > 0):
+        return None
+    u = urlparse(NEXUS_LINK_BASE)
+    if not u.hostname:
+        return None
+    port = u.port or (443 if u.scheme == "https" else 80)
+    guard = SubGuard(u.hostname, port, own_ip=await _public_ip(), relays=SUB_RELAYS,
+                     duckdns_token=DUCKDNS_TOKEN, rf_check=rf_check.check_targets, notify=notify_admin)
+    if DUCKDNS_TOKEN and not guard.duckdns_domain:
+        log.warning("DUCKDNS_TOKEN задан, но %s - не домен duckdns.org: переключать адрес бот не будет.",
+                    u.hostname)
+    return guard
+
+
+@tasks.loop(minutes=max(SUB_GUARD_MINUTES, 1))
+async def sub_guard_loop():
+    try:
+        if sub_guard is not None:
+            await sub_guard.check()
+    except Exception:
+        log.exception("Ошибка проверки адреса подписки")
+
+
 # ---------- копия базы вне сервера ----------
 
 @tasks.loop(hours=24)
@@ -3064,7 +3125,8 @@ async def _setup():
         link_server = LinkServer(_sub_url_for, host=NEXUS_LINK_HOST, port=NEXUS_LINK_PORT,
                                  cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
                                  download_url=NEXUS_DOWNLOAD_URL, logo_path=AVATAR_FILE,
-                                 sub_content=serve_subscription if BOT_SUBSCRIPTION else None)
+                                 sub_content=serve_subscription if BOT_SUBSCRIPTION else None,
+                                 trusted_ips=SUB_RELAYS)
         try:
             await link_server.start()
         except Exception as e:
@@ -3141,6 +3203,10 @@ async def on_ready():
         asyncio.create_task(reconcile())  # хотя бы один раз при старте
     if DB_BACKUP_WEBHOOK_URL:
         BACKGROUND_LOOPS["db_backup_loop"] = db_backup_loop
+    global sub_guard
+    sub_guard = await make_sub_guard()
+    if sub_guard is not None:
+        BACKGROUND_LOOPS["sub_guard_loop"] = sub_guard_loop
     for loop in BACKGROUND_LOOPS.values():
         if not loop.is_running():
             loop.start()

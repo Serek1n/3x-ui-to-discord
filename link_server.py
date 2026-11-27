@@ -215,10 +215,13 @@ class LinkServer:
 
     def __init__(self, sub_url_for, *, host: str = "0.0.0.0", port: int = 8444,
                  cert: str = "", key: str = "", download_url: str = "", logo_path: str = "",
-                 sub_content=None):
+                 sub_content=None, trusted_ips=()):
         self.sub_url_for = sub_url_for
         # sub_content(token) -> (тело, заголовки) | None (нет такой подписки) | "unavailable"
         self.sub_content = sub_content
+        # Запасные точки входа (deploy/relay.sh): через них идут запросы всех
+        # пользователей сразу, поэтому лимит по IP к ним не применяется.
+        self.trusted_ips = set(trusted_ips)
         self.host = host
         self.port = port
         self.cert = cert
@@ -232,6 +235,8 @@ class LinkServer:
         self._misses: dict = {}   # ip -> [время неверных subId за MISS_WINDOW]
 
     def _limited(self, ip: str, now: float) -> bool:
+        if ip in self.trusted_ips:
+            return False
         hits = [t for t in self._hits.get(ip, ()) if now - t < 60]
         misses = [t for t in self._misses.get(ip, ()) if now - t < MISS_WINDOW]
         self._hits[ip], self._misses[ip] = hits, misses
