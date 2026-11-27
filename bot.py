@@ -195,7 +195,9 @@ SUB_UPDATE_HOURS = _env_int("SUB_UPDATE_HOURS", "12")
 # Защита адреса подписки от блокировки IP в РФ (см. sub_guard.py):
 # SUB_RELAYS - IP запасных точек входа (deploy/relay.sh на VPN-серверах), через запятую;
 # DUCKDNS_TOKEN - чтобы бот сам переключал домен из NEXUS_LINK_BASE на доступную точку.
-SUB_RELAYS = [x for x in re.split(r"[\s,;]+", _env("SUB_RELAYS")) if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", x)]
+# SUB_RELAYS: IP или домены через запятую; auto - все серверы из блоков XUI_… этого .env.
+SUB_RELAYS_RAW = [x for x in re.split(r"[\s,;]+", _env("SUB_RELAYS")) if x]
+SUB_RELAY_IPS: set = set()   # IP запасных точек: обновляется при каждой проверке
 DUCKDNS_TOKEN = _env("DUCKDNS_TOKEN", "")
 BOT_PUBLIC_IP = _env("BOT_PUBLIC_IP", "")
 SUB_GUARD_MINUTES = _env_int("SUB_GUARD_MINUTES", "15")
@@ -2883,6 +2885,21 @@ async def _public_ip() -> str:
         return ""
 
 
+def relay_hosts(sub_host: str) -> list:
+    """Запасные точки: из SUB_RELAYS, а слово auto - адреса всех серверов из .env."""
+    out = []
+    for item in SUB_RELAYS_RAW:
+        if item.lower() == "auto":
+            for panel in [primary] + extra_panels:
+                url = XUI_BASE_URL if panel is primary else panel.env.get("base_url", "")
+                host = urlparse(url or "").hostname
+                if host and host != sub_host and host not in out:
+                    out.append(host)
+        elif item != sub_host and item not in out:
+            out.append(item)
+    return out
+
+
 async def make_sub_guard():
     """Включается в режиме подписки от бота, если включена проверка из РФ."""
     if not (bot_mode() and RF_CHECK and SUB_GUARD_MINUTES > 0):
@@ -2891,8 +2908,10 @@ async def make_sub_guard():
     if not u.hostname:
         return None
     port = u.port or (443 if u.scheme == "https" else 80)
-    guard = SubGuard(u.hostname, port, own_ip=await _public_ip(), relays=SUB_RELAYS,
-                     duckdns_token=DUCKDNS_TOKEN, rf_check=rf_check.check_targets, notify=notify_admin)
+    guard = SubGuard(u.hostname, port, own_ip=await _public_ip(), relays=relay_hosts(u.hostname),
+                     duckdns_token=DUCKDNS_TOKEN, rf_check=rf_check.check_targets, notify=notify_admin,
+                     trusted=SUB_RELAY_IPS)
+    await guard.relay_ips()
     if DUCKDNS_TOKEN and not guard.duckdns_domain:
         log.warning("DUCKDNS_TOKEN задан, но %s - не домен duckdns.org: переключать адрес бот не будет.",
                     u.hostname)
@@ -3126,7 +3145,7 @@ async def _setup():
                                  cert=NEXUS_LINK_CERT, key=NEXUS_LINK_KEY,
                                  download_url=NEXUS_DOWNLOAD_URL, logo_path=AVATAR_FILE,
                                  sub_content=serve_subscription if BOT_SUBSCRIPTION else None,
-                                 trusted_ips=SUB_RELAYS)
+                                 trusted_ips=SUB_RELAY_IPS)
         try:
             await link_server.start()
         except Exception as e:

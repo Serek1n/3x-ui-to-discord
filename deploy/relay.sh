@@ -7,7 +7,9 @@
 # заблокируют в РФ, бот переключит домен подписки на эту точку (DuckDNS).
 #
 # Установка (на VPN-сервере, от root):
-#   curl -fsSL https://raw.githubusercontent.com/Serek1n/3x-ui-to-discord/main/deploy/relay.sh | bash -s -- IP_СЕРВЕРА_БОТА [ПОРТ]
+#   curl -fsSL https://raw.githubusercontent.com/Serek1n/3x-ui-to-discord/main/deploy/relay.sh | bash -s -- АДРЕС_СЕРВЕРА_БОТА [ПОРТ]
+# АДРЕС - IP сервера бота или его отдельный домен. Только НЕ домен подписки
+# (NEXUS_LINK_BASE): при блокировке он будет указывать сюда же.
 # Удаление:
 #   bash relay.sh --remove
 
@@ -31,10 +33,14 @@ fi
 BOT_IP="${1:-}"
 PORT="${2:-8444}"
 
-if ! [[ "$BOT_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-  echo "Укажите IP сервера с ботом (именно IP, не домен - домен будет указывать сюда):" >&2
+if ! [[ "$BOT_IP" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+  echo "Укажите IP или домен сервера с ботом (не домен подписки - он будет указывать сюда):" >&2
   echo "  bash relay.sh 203.0.113.10 [порт]" >&2
   exit 1
+fi
+if ! [[ "$BOT_IP" =~ ^[0-9.]+$ ]]; then
+  echo "!! Адрес бота задан доменом ($BOT_IP). Это не должен быть домен подписки из NEXUS_LINK_BASE:"
+  echo "!! при блокировке он будет указывать на эту точку, и запросы пойдут по кругу."
 fi
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   echo "Неверный порт: $PORT" >&2

@@ -15,8 +15,10 @@ OK, BLOCKED, PARTIAL = RFResult(5, 5), RFResult(0, 5), RFResult(2, 5)
 
 
 class World:
-    def __init__(self, dns=BOT, states=None, ddns_ok=True):
+    def __init__(self, dns=BOT, states=None, ddns_ok=True, names=None, dead=()):
         self.dns = dns
+        self.names = names or {}
+        self.dead = set(dead)       # IP без установленной точки входа
         self.states = states or {}
         self.ddns_ok = ddns_ok
         self.updates = []
@@ -26,7 +28,10 @@ class World:
         return {name: self.states.get(t.split(":")[0], OK) for name, t in targets.items()}
 
     async def resolve(self, host):
-        return self.dns
+        return self.names.get(host, self.dns)
+
+    async def probe(self, ip):
+        return ip not in self.dead
 
     async def ddns(self, ip):
         if self.ddns_ok:
@@ -38,9 +43,9 @@ class World:
         self.notes.append((kw.get("title"), kw.get("level"), text))
 
 
-def guard(w, relays=(R1, R2), token="tok", host="nexusbot.duckdns.org"):
+def guard(w, relays=(R1, R2), token="tok", host="nexusbot.duckdns.org", trusted=None):
     return SubGuard(host, 8444, own_ip=BOT, relays=relays, duckdns_token=token, rf_check=w.rf,
-                    notify=w.notify, resolve=w.resolve, duckdns_update=w.ddns)
+                    notify=w.notify, resolve=w.resolve, duckdns_update=w.ddns, probe=w.probe, trusted=trusted)
 
 
 async def test_ok_does_nothing():
@@ -119,6 +124,36 @@ async def test_duckdns_refused():
     check(w.notes[-1][0] == "Адрес подписки не переключён", w.notes)
 
 
+async def test_relays_by_domain():
+    """В SUB_RELAYS можно писать домены (например, адреса панелей из .env)."""
+    trusted = set()
+    w = World(states={BOT: BLOCKED}, names={"nl.example.org": R1, "pl.example.org": R2})
+    g = guard(w, relays=("nl.example.org", "pl.example.org"), trusted=trusted)
+    await g.check()
+    await g.check()
+    check(w.updates == [R1], f"домен точки не разрешён: {w.updates}")
+    check(trusted == {R1, R2}, f"IP точек не переданы переходнику: {trusted}")
+
+
+async def test_server_without_relay_is_skipped():
+    """Сервер есть в списке, но точка входа на нём не стоит - на него не переключаем."""
+    w = World(states={BOT: BLOCKED}, dead={R1})
+    g = guard(w)
+    await g.check()
+    await g.check()
+    check(w.updates == [R2], f"переключил на сервер без точки входа: {w.updates}")
+
+
+async def test_auto_relays_from_env():
+    """SUB_RELAYS=auto - адреса всех серверов из блоков XUI_… (кроме домена подписки)."""
+    from harness import load
+    bot = load(extras=1, SUB_RELAYS="auto, 203.0.113.99", XUI_BASE_URL="https://fi.example.org:2053",
+               XUI2_BASE_URL="https://nl.example.org:43558")[0]
+    hosts = bot.relay_hosts("nexusbot.duckdns.org")
+    check(hosts == ["fi.example.org", "nl.example.org", "203.0.113.99"], hosts)
+    check(bot.relay_hosts("fi.example.org") == ["nl.example.org", "203.0.113.99"], "домен подписки в списке точек")
+
+
 async def test_relays_not_rate_limited():
     import aiohttp
     from link_server import LinkServer
@@ -146,5 +181,6 @@ async def test_relay_script():
 sub_guard.CONFIRM_CHECKS = 2
 run([test_ok_does_nothing, test_switch_after_two_blocked_checks, test_single_glitch_resets,
      test_skips_blocked_relay_prefers_ok_over_partial, test_back_to_bot_when_relay_blocked, test_all_blocked_alerts,
-     test_without_token_only_alerts, test_not_duckdns_only_alerts, test_duckdns_refused, test_relays_not_rate_limited,
+     test_without_token_only_alerts, test_not_duckdns_only_alerts, test_duckdns_refused, test_relays_by_domain,
+     test_server_without_relay_is_skipped, test_auto_relays_from_env, test_relays_not_rate_limited,
      test_relay_script])
